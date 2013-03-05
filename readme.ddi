@@ -1,0 +1,1490 @@
+
+      Installation guide for the Distributed Data Interface (DDI)
+
+                           Table of contents
+                             January 2009
+
+                1. overview
+                2. implementation of DDI on SMP systems
+                3. compiling DDI
+                4. system configuration for SYSV
+                5. execution of GAMESS using ddikick.x
+                6. DDI running over SHMEM
+                7. DDI running over LAPI
+                8. DDI running over MPI
+                9. DDI running on the IBM Blue Gene
+               10. fallback to original DDI code
+
+This file contains technical information regarding the compilation of DDI,
+configuration of the system to support SYSV memory, and execution of GAMESS
+via the ddikick.x command.
+
+The 5th chapter of the GAMESS manual contains information about the
+parallelization of GAMESS using the DDI library, oriented towards users
+of the program.  This includes representative timing information,
+discussion of the two types of memory given in the input files, and
+execution of exetyp=check jobs.
+
+                    ---------------------------
+
+                          1. overview
+
+The executive overview (meaning no details at all) of what is meant by
+distributed data follows.  For simplicity, we start with uniprocessors:
+
+             node 0           node 1
+             CPU 0            CPU 1
+              r=0              r=1             (r=process rank)
+        ---------------   ---------------
+        |    GAMESS  X|   |    GAMESS  X|        compute
+        |   quantum   |   |   quantum   |       processes
+        |  chem code  |   |  chem code  |
+        ---------------   ---------------
+        |  DDI code   |   |  DDI code   |
+        ---------------   ---------------      Input keyword:
+        |  replicated |   | replicated  |       <-- MWORDS
+        |  data       |   | data        |
+        ---------------   ---------------
+
+
+    -----------------------------------------
+    |   ---------------   ---------------   |  Input keyword:
+    |   |             |   |             |   |   <-- MEMDDI
+    |   |  memory in  |   |  memory in  |   |
+    |   |  node 0     |   |  node 1     |   |
+    |   |             |   |             |   |
+    |   |             |   |             |   |
+    |   |             |   |             |   |
+    |   ---------------   ---------------   |
+    -----------------------------------------
+
+
+              r=2              r=3
+        ---------------   ---------------
+        |    GAMESS   |   |    GAMESS   |         data
+        |   quantum   |   |   quantum   |       servers
+        |  chem code  |   |  chem code  |
+        ---------------   ---------------
+        |  DDI code  X|   |  DDI code  X|
+        ---------------   ---------------
+
+The idea is to have that very large box encompass a truly enormous
+amount of memory, to store the N**4 data structures that appear in
+quantum chemistry.  The 'distributed data' arrays are therefore
+divided across all nodes.  The portions of GAMESS which use distributed
+data will store most of their data in this distributed fashion, but
+some portions of GAMESS which do not need such large memory do not
+need these arrays (and MEMDDI=0 can be used to specify this).  The
+'replicated memory' belonging to each compute process is private to
+that process, and typically the N**2 arrays are stored here.
+
+Now, for some terminology.
+   CPU: a processor core.  There might be more than one core in a
+        single silicon chip, or not.  Any such core is a CPU,
+        for the purpose of the discussion here.
+        It is more or less irrelevant how many pieces of silicon
+        are in your system, what matters is how many CPUs (cores)
+        you have.
+  node: an SMP enclosure, containing one or more CPUs.
+   SMP: symmetric multiprocessor, a computer node with more than one CPU,
+        with all CPUs sharing the physical memory of the enclosure.
+  rank: the process number assigned to a parallel task, r=0,1,...
+
+"Shared memory" has several different connotations, and the names often
+contain the same letters "shm".  The different types of shared memory are
+   SYSV memory:
+       memory shared inside a node using System V type calls, for example
+       the memory allocation routines 'shmget' and 'shmat'.  SYSV memory
+       calls are available on most versions of Unix, including Linux.
+       However, the computer often needs to have the SYSV limits raised
+       by the 'root' user before GAMESS can make use of these routines.
+   SHMEM memory:
+       a software library sharing memory between nodes, usually over
+       a very good network, and found mainly on high-end machines,
+       particularly Cray systems.
+   distributed data:
+       the type of large shared memory array being implemented by DDI,
+       in which the memory is shared both within SMP nodes by SYSV calls,
+       and between nodes, usually by TCP/IP sockets (or MPI-1).  On a few
+       high-end machines, DDI is implemented over SHMEM or LAPI instead.
+
+Distributed data is transferred into and out of the replicated memory
+of the compute processes using the DDI_PUT and DDI_GET calls, which
+might be imagined to be analogous to WRITE and READ to access disk
+files.  In addition to storing results, new terms may be summed into
+an existing array by the accumulate operation, called DDI_ACC.  These
+three subroutines are the essence of how DDI is used to implement
+parallel quantum chemistry calculations.
+
+Any process within a node (compute processes or data servers) can
+access the local portion of the distributed data directly.  Thus a
+compute process can use the local data directly, without assistance
+from a data server.  The purpose of the data server processes is to
+handle DDI_GET, DDI_PUT, or DDI_ACC requests involving remote nodes,
+using the network in the parallel system.
+
+The next section fills in the details behind this overview.
+
+                    ---------------------------
+
+              2. implementation of DDI on SMP systems.
+
+The Distributed Data Interface (DDI) exists to provide a distributed
+shared memory, for storage of very large arrays, by combining memory
+belonging to all nodes to a very large total.  This memory is accessed
+by memory to memory copies inside SMP nodes, and by the network when
+accessing remote memory.  The implementation has been specifically
+tuned to clusters built from SMP enclosures, which are of course the
+most commonplace parallel computer system today.   However, a SMP model
+includes as limiting cases single CPU clusters, e.g. uniprocessor PCs
+connected by a Fast or Gigabit Ethernet switch, or NUMA systems like
+the SGI Altix where all CPUs exist in a single system image.  Thus DDI
+is considered to be a univerally applicable parallelism model on which
+to construct GAMESS.
+
+Prior to June 1999, GAMESS utilized ordinary message passing libraries
+such as TCGMSG or MPI-1 that lack any support for distributed data.
+To that point, GAMESS was therefore a replicated memory parallel
+program, of ordinary type.  This supported all parallelization efforts
+made from 1991 through 1999.
+
+Since 1999, three versions of DDI have been introduced, as described
+below.
+
+The first version of DDI was introduced in June 1999, in order to support
+a distributed memory MP2 gradient program.  The system software needed
+to support DDI was deliberately kept minimal:
+   a) a TCP/IP stack supporting standard socket calls, i.e every Unix.
+   b) use of the standard rsh command to launch processes on remote
+      nodes, although ssh may be used instead.
+   c) no 'root' level system reconfiguration required, at all.
+
+In 2003, support for asynchronous point to point messages was added to
+support an ongoing coding project, not yet included in the production
+version of GAMESS.  This required use of the thread library.  We have
+encountered only one very old Unix operating system that did not have
+a standard thread library (there is a work around for no pthreads).  One
+important design goal for the second version of DDI was to use exactly
+the same subroutine calls as originally, so that no changes need be
+made in the GAMESS application.  This means it is possible to use the
+first version of DDI in circumstances in case the later versions cannot
+be installed (probably only where system level configuration parameters
+cannot be reset).  Accordingly, the original source code has been included
+in the ddi/oldsrc directory, and the final part of this file tells how to
+fall back to the original DDI version.  The first version of DDI used
+the Cray system product called SHMEM on the Cray T3E, and SHMEM support
+continues to exist in the second version.  The first version of DDI was
+designed by Graham Fletcher, then at ISU, with some programming by Mike
+Schmidt.
+
+The first version of DDI implemented distributed data by running an
+additional process on every CPU.  Of course, each CPU runs a process
+performing quantum chemical calculations, which is termed the 'compute
+process'.  The additional process allocated a large block of memory,
+and did nothing but control access to this, hence it is termed a 'data
+server'.  Both types of processes are GAMESS executables, gamess.x,
+but they do quite different things.  Experience from 1999 onward has
+taught us that this is a somewhat unusual concept, so let's be very
+plain spoken here:
+    a) p CPUs will normally run 2p processes named gamess.x
+    b) the first half of these are 'compute processes', and carry
+       out quantum chemistry job.  Any 'compute process' can be
+       expected to consume extensive CPU resources, and perhaps to
+       perform disk I/O operations.
+    c) the second half of these are 'data servers'.  They enter a
+       routine which loops indefinitely to handle requests for data.
+       The amount of CPU time required for this purpose is rather
+       modest, so coexistence of a 'data server' and a 'compute
+       process' on the same CPU hardly slows down the computations.
+    d) the quantum chemistry algorithms attempt to maximize use of
+       data belonging to the local data server.  The traffic between
+       the compute process of rank n (0 <= n <= p-1) and its own
+       data server, which has rank n+p, is therefore much higher than
+       that to any other data server.
+The X shown in the picture above shows which part of a gamess.x process
+is executing.
+
+Already in 1999 it was clear that TCP/IP sockets alone were not the most
+efficient implementation.  In particular, the high traffic path between
+a compute process and its own data server means that sending this
+traffic over a TCP/IP socket call was inefficient.  As the years have
+gone by, SMP nodes have become almost more common than uniprocessors,
+increasing the number of intra-box messages being handled by DDI.
+
+Therefore, the second version of DDI was introduced in May 2004, with
+the specific goal of improving performance inside SMP enclosures.  The
+second version of DDI also introduced the concept of subgroups, which
+are discussed below.  The second version of DDI is due to Ryan Olson,
+with help from Alistair Rendell of the Australian National University,
+with the subgroup idea originating with Dmitri Fedorov at AIST.
+
+Portability and the ability to run on cheaper clusters, using tools
+cmmonly found in Unix continues to be an important design goal.  The
+second version of DDI therefore requires only slightly more from
+the operating system than in 1999:
+   a) a System V library implementing shared memory calls, for high
+      performance intra-node messages.
+   b) a TCP/IP stack supporting socket calls for inter-node messages.
+   c) a thread library to implement asynchronous messages.
+   d) use of the rsh command to launch processes on remote
+      nodes, although ssh may be used instead.
+The necessary SYSV calls are missing on some older Unix systems, see
+below for specific details.  In addition, a number of computer
+companies ship their operating systems with the SYSV parameters set
+to very small values, making it necessary to increase them.  This
+process requires the reset of a few parameters, and a reboot of the
+machine(s), and can only be carried out with knowledge of the 'root'
+password.  If you are not able to pursuade your system manager to
+change these parameters, the first version of DDI can still be used,
+as a last resort, or select SYSV off when compiling the new DDI.
+
+In the second version of DDI, data servers do not run
+    1. when DDI is running within a single SMP enclosure
+    2. when DDI is implemented over the SHMEM library, e.g. the Crays
+    3. when DDI is implemented over LAPI, e.g. the IBM SP
+In all other circumstances (namely, much of the time), a job which is
+run on p CPUs will run 2p GAMESS processes, of which one half compute,
+and one half manage data.  It is still true that the 'compute processes'
+do quantum chemistry, chew through CPU time, may perform disk I/O,
+and each owns its own copy of the replicated memory array, whose size
+is fixed by the MWORDS input.  The 'data servers' manage the access
+to the distributed memory, use even less CPU time than before, and
+perform only the inter-node messaging (usually by TCP/IP).
+
+The GAMESS processes, whether functioning as compute processes or
+as data servers, are started up by the kickoff program, ddikick.x.
+The new version of DDI has a different set of arguments for the
+ddikick.x command, to define SMP usage.  The exact syntax for
+execution is discussed later in this file.
+
+SYSV shared memory regions are allocated by just one process on each
+node, using the routine 'shmget'.  In contrast to 'malloc' (which is
+still used for the replicated memory owned by each compute process,
+and is a private memory accessible only to that process), the 'shmget'
+routine creates memory that is sharable.  All other processes in the
+same node can attach (shmat) to this memory, and read and write it.
+Semaphore routines (semop) associated with SYSV control the read
+and write accesses.  The effect is to make all messages between the
+compute processes and local data servers occur at the speed of the
+memory bus in the node.  The only cost associated with such access
+is a single memory to memory copy of the data.  In addition, the new
+version of DDI decreases the number of messages sent through TCP/IP
+sockets to remote nodes.  For example, the accumulate operation used
+to be four separate messages to a node containing 4 CPUs, one to
+each data server.  Now, these are combined to a single, longer
+message, which can be handled by any of the four data servers on
+that remote node.
+
+As already stated, a design goal of DDI is to be able to run on any
+type of Unix computer, using nearly ubiquitous features of Unix.  As
+proof of this, it may interest you to know that nearly all Ryan's
+development work was done on a Macintosh laptop (1 CPU), under version
+10.2 of the Mac OS X operating system, by pretending it was a SMP
+system and running multiple processes.  Simultaneous testing was done
+on Australia National University's Compaq Supercluster, using SHMEM,
+and an IBM cluster back home at Iowa State University.  Thus DDI can
+still be run on essentially any Unix cluster, while it has optimizations
+for high end machines such as Cray systems or IBM SP.
+
+The other design goal of the second version of DDI was to add SMP support,
+particularly by increasing the intra-node message speed to that of the
+internal memory bus.
+
+The second version of DDI also supported the concept of "groups" of
+processors, in which different subsets of the processors work on
+completely independent quantum mechanical computations.  The only part
+of GAMESS using this at the present time is the Fragment MO method, in
+which large molecules are divided into regions whose wavefunctions are
+evaluated separately (but in the field of all other regions, of course).
+Group DDI is not supported by the fallback DDI first version.
+
+The third version of DDI was introduced in October 2006, to support
+a parallel CCSD(T) program.  This version
+    a) introduced node-replicated data, which only functions on
+       machines which support System V shared memory
+    b) cleaned up internally the subgroup support
+    c) fixed MPI-related bugs
+Node-replicated data is data that is stored once per node, with the
+entire data structure then replicated on every other node.  This data
+does not have an input keyword associated with it (MWORDS is for
+process-replicated data, and MEMDDI for distributed data).  The
+data is stored using System V memory calls, so the operating system's
+limit on total shared memory does enforce a limit on this class.
+
+A picture (for dual CPU nodes) is worth a thousand words:
+
+    -----------------------------       -----------------------------
+    |     CP 0         CP 1     |       |     CP 2         CP 3     |
+    |  ----------   ----------  |       |  ----------   ----------  |
+    |  |        |   |        |  |       |  |        |   |        |  |
+    |  | MWORDS |   | MWORDS |  |       |  | MWORDS |   | MWORDS |  |  GAMESS
+    |  |  t-ia  |   |  t-ia  |  |       |  |  t-ia  |   |  t-ia  |  | processes
+    |  ----------   ----------  |       |  ----------   ----------  |
+    |                           |       |                           |
+    |  -----------------------  |       |  -----------------------  |
+    |  |   node-replicated   |  |       |  |   node-replicated   |  |   SysV
+    |  |     (no keyword)    |  |       |  |     (no keyword)    |  |  shared
+    |  |                     |  |       |  |                     |  |  memory
+    |  |       t-ij,ab       |  |       |  |       t-ij,ab       |  | segments
+    |  -----------------------  |       |  -----------------------  |
+    |                           |       |                           |
+ ------------------------------------------------------------------------
+ |  |                           |       |                           |   |
+ |  |                           |       |                           |   |
+ |  |                           |       |                           |   |
+ |  |               fully distributed storage of the                |   |
+ |  |     [VV|OO], [VV|OO], [VO|VO], [VO|OO], [OO|OO] integrals     |   |
+ |  |          The area of this entire big box is MEMDDI            |   | more
+ |  |                           |       |                           |   | SysV
+ |  |                           |       |                           |   | segs
+ |  |                           |       |                           |   |
+ ------------------------------------------------------------------------
+    |                           |       |                           |
+    |  ----------   ----------  |       |  ----------   ----------  |  GAMESS
+    |  |  DS 4  |   |  DS 5  |  |       |  |  DS 6  |   |  DS 7  |  | processes
+    |  ----------   ----------  |       |  ----------   ----------  |
+    |                           |       |                           |
+    -----------------------------       -----------------------------
+
+What you are supposed to learn from this picture includes the following
+ideas, as used by the parallel CCSD(T) program:
+   a) the ranks of the compute processes (CP) are lower than the ranks
+      for the data server processes (DS), with one DS living on the same
+      CPU as its partner CP (the ranks differ by exactly p, the number
+      of CPUs in use).
+   b) there is a keyword showing how small data structures, like the
+      CCSD singles amplitudes (t-ia) are stored over and over and over
+      again, for convenent access by each CP.  These are counted against
+      the memory keyword MWORDS in $SYSTEM.
+   c) the transformed integrals are stored only once, in the entire
+      parallel run's memory, in a fully distributed fashion.  The
+      total memory needed for this is controlled by MEMDDI in $SYSTEM.
+      Here, V=virtual MO and O=occupied MO.
+   d) the large matrix of doubles amplitude is being stored once per
+      node, with all CPUs in that node able to access that copy.
+      The entire double amplitude memory is stored a second time on
+      the second node.  The term "node-replicated" means one copy
+      per node, shared by all CP's in that node.  There is no keyword
+      in the GAMESS input placing a limit on the size of this matrix,
+      at least at the present time. (here i and j = occupied MO, and
+      the indices a and b are virtual MOs, so this is a quartic
+      sized matrix).
+
+If you think about the storage map above, you will see that the CCSD(T)
+program likes having very large memory per node, and having as many
+CP's as possible inside the node (so that the doubles amplitudes are
+shared by many processors).
+
+This section closes with references describing the computer science
+details, for the first version,
+      G.D.Fletcher, M.W.Schmidt, B.M.Bode, M.S.Gordon
+         Comput.Phys.Commun. 128, 190-200 (2000)
+second,
+      R.M.Olson, M.W.Schmidt, M.S.Gordon, A.P.Rendell,
+         Proc. of Supercomputing 2003, IEEE Computer Society.
+         This article does not exist on paper, but can be found at
+         http://www.sc-conference.org/sc2003/tech_papers.php
+      D.G.Fedorov, R.M.Olson, K.Kitaura, M.S.Gordon, S.Koseki
+         J.Comput.Chem. 25, 872-880(2004)
+ and third version,
+      J.L.Bentz, R.M.Olson, M.S.Gordon, M.W.Schmidt, R.A.Kendall
+         Comput.Phys.Commun.  176, 589-600(2007)
+      R.M.Olson, J.L.Bentz, R.A.Kendall, M.W.Schmidt, M.S.Gordon
+         J.Comput.Theoret.Chem. 3, 1312-1328(2007)
+
+                    ---------------------------
+
+                        3. compiling DDI
+
+The 'compddi' script should handle all the details, including the
+special cases of the system library being SHMEM, or needing to run the
+original version of DDI.  In most cases all you have to do is select the
+machine type, and execute the script.  If all goes well, compddi will
+produce a library file ~/gamess/ddi/libddi.a and the process kickoff
+program ~/gamess/ddikick.x.  The library file will always be created,
+for use in the linking step that creates the GAMESS binary.  The kickoff
+program will not be created in special cases, namely those systems
+using SHMEM, the IBM SP which runs DDI over LAPI (and in some special
+circumstances when MPI is used instead of socket calls).
+
+Execution of GAMESS using DDI will require two things.  One is the
+configuration of the 'rungms' script to put in the details of your
+computer system.  The other is the configuration of your system to
+permit the use of SYSV memory calls.  These two topics are handled in
+the next two sections.
+
+                    ---------------------------
+
+                 4. system configuration for SYSV
+
+Many computer companies ship their operating systems with the parameters
+for SYSV set to values too small to be useful.  Chief among these is the
+maximum number of bytes in a single shared memory region, usually called
+with a name containing 'shmmax', but in some cases limits on the semaphores
+also need to be raised.  On our own computers, where we allow a single
+GAMESS application to use all the physical memory of the computer, we
+just set the 'shmmax' memory limit equal to the installed RAM.
+
+Small system parameters cause errors when GAMESS tries to allocate memory,
+at the very beginning of runs.  The error message may very well include
+the subroutine name 'shmget'.  However, Mac OS X 10.2 just crashes the
+computer, completely, if the limits are exceeded!  So it is good to at
+least execute the commands below that will display the limits, to see if
+they are large enough, before you try to run GAMESS.
+
+A table of how many bytes might be contained in your memory is useful,
+       384 MByte      402,653,184
+       512 MByte      536,870,912
+         1 GByte    1,073,741,824
+       1.5 GByte    1,610,612,736
+         2 GByte    2,147,483,648
+         4 GByte    4,294,967,296
+         8 GByte    8,589,934,592
+        16 GByte   17,179,869,184
+It is possible that some of the 32 bit operating systems may not allow
+you to enter a value larger than the maximum positive signed integer,
+namely one less than 2 GByte.
+
+Unfortunately, at the system management level, different forms of Unix are
+often entirely different.  Below we put notes on every machine we use,
+supplemented by information from the Internet.
+
+System V memory is part of the Interprocess Communication (IPC) software,
+so the letters ipc appear frequently below, along with shm for shared
+memory and sem for semaphore.
+
+Many systems will show the current usage by
+     ipcs -a
+and will allow removal of dead semaphores by
+     ipcrm -s mmm -s nnn
+where mmm and nnn are the numbers of unused semaphores, accidentally
+not cleared up.  Defunct semaphores should occur only rarely, if at all.
+
+The notes below for each system discuss semaphore tunables, and the
+very important "shmmax".  In case your machine consists of a SMP-style
+machine with a large total memory, you may also need to reset "shmall".
+The procedure will be like tuning "shmmax", so the discussion of the
+tunable "shmall" is addressed in a general way below, after all of the
+specific machine tunings.
+
+In case you notice any errors in this information, or learn how to fill
+in the places marked 'unknown', please send E-mail to Mike Schmidt.
+
+
+Compaq AXP
+----------
+The Alpha CPU is found in enclosures labeled Digital, Compaq, or HP,
+and the operating system has been called OSF/1, Digital Unix, and Tru64.
+SYSV memory seems to be available from Digital Unix 4.0D on up.  The
+default parameters are too small to be useful.
+
+How to display the settings:
+  /sbin/sysconfig -q ipc
+How to reset the parameters:
+  vi /etc/sysconfigtab    in order to add the lines
+      ipc:
+          shm-max=2147483647
+          sem-mni=128
+  below the proc: clause, and reboot the computer.
+
+In addition, Linux is often used today on AXP CPUs.  See the section
+below about reconfiguring 32 bit Linux for Intel-compatible CPUs.
+
+
+Compaq Supercluster, Cray T3E, Cray X1
+--------------------------------------
+All of these run DDI over the SHMEM library, these systems do not use
+SYSV memory calls.  So, SYSV tuning is irrelevant.
+
+
+Cray PVP
+--------
+unknown
+
+
+Fujitsu PrimePower
+------------------
+unknown
+
+
+HP-UX
+-----
+This means PA-RISC CPUs, running the HP-UX operating system.
+The 32 bit HP systems allow no more than 1 GByte per segment,
+but default to 64 MBytes.  The 64 bit kernel allows shmmax to
+be as much as 1 TByte.
+
+How to display the settings:
+   sam -> kernel config -> configurable parameters, look, then quit
+How to reset the parameters:    (necessary only on 32 bit kernels)
+   sam -> kernel config -> configurable parameters
+   click shmmax, change pop up window's value to 0x40000000,
+      namely 7 rather than 6 zeros.  This is hex for 1 GByte.
+   actions -> apply new kernel, and allow it to reboot
+
+HP-UX uses the spelling 'remsh' instead of 'rsh' for the remote
+shell!  A different kind of rsh, restricted shell exists on HP-UX.
+You may use the environment variable DDI_RSH to specify this
+different name,
+   setenv DDI_RSH /usr/bin/remsh
+or perhaps some more secure remote shell launcher such as ssh.
+
+We use the 'hpux64' target on a system containing Itanium2 CPUs,
+and DDI works as distributed.  Howver, we have heard that the
+flag -Dsocklen_t=int in the CFLAGS variable leads to an inability
+to compile on a 64 bit HP-UX system using PA-RISC CPUs.  The fix
+to this was to edit, by hand, the six occurences of this data type,
+     ~/gamess/ddi/src/soc_create.c
+     ~/gamess/ddi/src/tcp_sockets.c
+     ~/gamess/ddi/include/mysystem.h
+which appear twice in each file, from 'socklen_t' to 'int', and
+then compile with the offending -Dsocklen_t removed.  Ugly, but it
+is said to work.
+
+IBM
+---
+This means any type of Power CPU, running AIX.
+AIX ordinarily needs no tuning.  Prior to AIX 4.3.1, the limit for
+shmmax was set to 256 MBytes, but starting from 4.3.1 the limit is
+quite reasonable:
+    32 bit kernel:  2 GBytes (which cannot be raised from this value)
+    64 bit kernel: 64 GBytes
+In order to use more than 4-way SMP nodes under AIX, it is necessary
+to set the environment variable EXTSHM to 'ON'.
+
+
+IBM SP
+------
+This should use DDI running over LAPI, an IBM library that handles one-
+sided messaging, so that there are no data server processes.  Some of
+the messsages use IBM's MPI in addition to the LAPI messages, all of
+which should travel on the SP's switch in "user space" mode.  Scripts
+are provided for execution under the LoadLeveler schedular, see 'llgms'
+which front-ends the usual 'rungms'.
+
+This machine uses SYSV memory to implement DDI, and like ordinary IBM
+workstations (see just above) will not require any system tuning.
+
+
+Linux on Itanium2
+-----------------
+The procedure is the same as 32 bit Linux, see below.
+Check the default settings before doing any reconfiguration.
+
+Our HP nodes required reconfiguration from quite small default values,
+which is probably typical for Linux on Itanium systems.
+
+The Altix seems to be different from a standard RedHat package due to
+SGI's ProPack, and its large SMP nature.  Our older version of ProPack
+came with "shmmax" set to 70% of the main memory in /etc/rc.sysinit,
+which was fine for our 4-CPU Altix. Newer versions of ProPack may require
+that you tune the "shmmax" parameter in the normal Linux way, through
+the /etc/sysctl.conf file.  You can check your settings by
+      /sbin/sysctl -a | grep shm        or      grep sem
+The setting needed by GAMESS for "shmmax" is just the memory per
+CPU, with "shmall" being the entire machine's RAM (or, say, 90% of
+it).  A large Altix may require setting the number of semaphores
+upwards, in the 4th parameter below,
+      sysctl -w kernel.sem="250 32000 32 128"
+That example is the default for our 4-way node.   See below for general
+information on the setting of "shmall" and "shmmax" values.
+
+
+Linux on 32 bit Intel-compatible
+--------------------------------
+The shmmax parameter is set quite small, e.g. 32 MBytes, so that
+reconfiguration is probably necessary.
+With old kernels (e.g. RedHat 6.1 and older, where the /sbin/sysctl
+command is missing) the process requires rebuilding the kernel, which
+is so difficult that it would be simpler to upgrade your operating
+system, or fall back to using the original DDI version.
+From RedHat 6.2 on up (kernel version 2.2.14), the instructions below
+are easy to follow.
+
+How to display the settings:
+  /sbin/sysctl -a | grep shmmax    shows the limit in bytes
+  ipcs -l                          "max seg size" is the same number, in KB
+  ipcs -a       will show current usage information
+How to reset the parameters:
+  vi /etc/sysctl.conf    in order to add the line
+      kernel.shmmax = 1610612736
+  and reboot the computer.  Linux allows this parameter to be set on
+  the fly, by "sysctl -w kernel.shmmax=1610612736", avoiding a reboot.
+
+
+Macintosh
+---------
+This means G4, G5, or Intel CPUs, running Mac OS X.
+Your version number will be under the Apple logo, "about this Mac"
+
+Version 10.1 contains no support for SYSV.
+You need to upgrade the OS, or fall back to the first version of DDI.
+
+Version 10.2 (Jaguar), 10.3 (Panther), 10.4 (Tiger), and 10.5 (Leopard)
+support SYSV.  The parameters need to be reset to be useable, in fact 
+10.2 crashes the computer if you run without resetting them.
+
+How to display the settings:
+      /usr/sbin/sysctl -a | grep sysv
+How to reset the parameters:
+  under 10.2: sudo vi /System/Library/StartupItems/SystemTuning/SystemTuning
+  under 10.3 or 10.4: sudo vi /etc/rc
+  in order to change the lines already present (in either case) to
+      /usr/sbin/sysctl -w kern.sysv.shmmax=8589934592
+      /usr/sbin/sysctl -w kern.sysv.shmmni=32
+      /usr/sbin/sysctl -w kern.sysv.shmall=2097152
+  and reboot the computer.  Some of the releases of OS X require that
+  shmmax be an integer multiple of the page size, which is 4096.  Like
+  other systems (see below), shmall must exceed shmmax divided by the
+  page size, so usually you have to reset it too.  These data = 8GBytes.
+
+  under 10.3 and 10.4, you can save your parameters permanently by
+  creating a file /etc/sysctl.conf (Apple does not provide this file),
+  containing your values,   (this example is for a 1 GB Apple)
+    % sudo vi /etc/sysctl.conf    to add 3 lines
+    kern.sysv.shmmax=1073741824
+    kern.sysv.shmmni=32
+    kern.sysv.shmall=262144
+  although you may still have to edit /etc/rc to comment out the
+  Apple supplied values, as Apple resets these after /etc/rc processes
+  the contents of /etc/sysctl.conf.  This way, at least your values
+  are still stored for reuse after the Apple updates.
+
+  under 10.5, the only way to reset SYSV parameters is creating the
+  file named /etc/sysctl.conf, see just above.
+
+If you allow software updates from Apple to occur, then you will
+likely need to repeat any editing of /etc/rc, as Apple likes to 
+overwrite the /etc/rc file during most updates.
+
+NEC SX series
+-------------
+unknown
+
+
+SGI
+---
+This means MIPS CPUs running Irix, not the new Itanium2 based Altix line.
+For the Altix, see the 64 bit Linux section above.
+
+The target "sgi32" presumes the use of TCP/IP sockets and SystemV memory:
+The system file /var/sysgen/mtune/kernel defines the shmmax parameter.
+This file defaults to shmmax=0, which causes the system to set the
+shmmax value to 80% of the available physical memory.  This is quite
+reasonable, and therefore it is unlikely you need to reconfigure Irix.
+
+The target "sgi64" presumes the use of SHMEM, because we have not been
+able to work out a bug using > 16 processes with the normal TCP/IP and
+SystemV stuff.  Instead, a special SHMEM code, ddio3k.src (which is
+quite different from the normal Cray SHMEM implementations) can be used.
+In the event you have a fairly small SGI box, you can use the usual
+socket code by
+   a) setting COMM to "sockets" in 'compddi'
+   b) deleting the "sgi64:" clause in the shmem part of 'lked', and
+      adding "sgi64:" next to the "sgi32:" in the sockets part
+   c) selecting "sockets" as the target in 'rungms'
+It is our understanding that the Message Passing Toolkit has been a
+standard part of Irix for several years, so hopefully you will find
+the SHMEM and MPI libraries as a result of having MPT installed.
+
+
+Sun
+---
+This means SPARC CPUs running Solaris.
+The default parameters are too small to be useful.
+
+For Solaris versions up to and including 9, display the settings by
+  /usr/sbin/sysdef -i | grep SHMMAX
+  /usr/sbin/sysdef -i | grep SEM
+    These might not display anything until after the reconfiguration.
+How to reset the parameters:
+  vi /etc/system    in order to add the lines
+      set shmsys:shminfo_shmmax=2147483648
+      set semsys:seminfo_semmni=256
+      set semsys:seminfo_semmns=256
+                    and also the lines
+      forceload: sys/shmsys
+      forceload: sys/msgsys
+      forceload: sys/semsys
+  and reboot the computer.  The semaphore counts should be increased
+  proportionally with the number CPUs, with 256 being for 4-way nodes.
+
+For Solaris 10, Sun is moving to finer control by "projects" which
+may be used as different categories of users.  It still works to set
+a limit for "system" wide usage by placing the above settings into
+the /etc/system file, with a reboot.  This is considered "obsolete",
+but it still works.  See "Solaris Tunable Parameters Reference Manual"
+at docs.sun.com for more information on "project" level settings.
+To display the settings, use these commands:
+   /usr/bin/prctl -n project.max-shm-memory $$
+   /usr/bin/prctl -n project.max-sem-ids $$
+   /usr/bin/prctl -n project.max-shm-ids $$
+
+The "shmall" tunable (all systems):
+
+The "shmall" parameter is the node's grand total System V memory usage,
+as opposed to the maximum size of each segment, "shmmax".  Thus the
+latter is the physical memory per CPU, while the former could be very
+large in a SMP system with a huge total physical memory.
+
+The tunable named "shmall" has units of 'pages', and should be:
+      (total desired shared memory in bytes) / (page size in bytes)
+You can learn your system's page size in bytes by
+      perl -e 'use POSIX; print sysconf(_SC_PAGESIZE),"\n"';
+Thus a 4-way SMP node with a total physical memory of 32 GBytes, and
+ which happens to print that its page size is 8096 would be tuned to
+      shmmax =  8*1024*1024*1024      bytes
+      shmall = 32*1024*1024*1024/8096 pages
+The computations reflect the fact that running GAMESS will allocate
+one (1) shared memory segment for every CPU.  To stay within the total
+of 32 GB, the maximum single segment running with p=4 need be only 8 GB.
+
+
+                    ---------------------------
+
+               5. execution of GAMESS using ddikick.x
+
+The kickoff program for DDI using TCP/IP sockets was updated to reduce
+kickoff time, ensure process clean-up if the DDI job crashes, and to
+conserve the number of TCP ports during initialization.
+
+The arguments for ddikick are as follows.
+
+ddikick.x <program> <program arguments> -ddi NN NP <nodelist> \
+   [-scr <scratch directory>]
+
+   NN: Number of Nodes (SMP enclosures).
+   NP: Number of Processors (CPUs).
+
+   <nodelist>: contains a list of the nodes in the following format:
+     <hostname>[:cpus=NCPUS][:netext=<ext1>,<ext2>,...]
+
+     <hostname>        - DNS hostname
+     :cpus=NCPUS       - Number of CPU on the node (default=1)
+     :netext=<ext>,... - List of network extensions appended to the
+                         <hostname> to signify a high performance network,
+                         e.g. myrinet, quadrics, gigabit, SCI, etc.
+
+   -scr: the scratch/working directory the program should run in.
+
+Here are some examples:
+
+1) The APAC SC consists of 4-way SMP nodes connected by Quadrics and
+   fast ethernet. The hostnames for each node are: sc0, sc1, etc.
+   sc0, sc1, etc. all resolve IP addresses that are on the fast ethernet
+   network.  To use the quadrics network, you must append the -eip0
+   extension, to change the names to sc0-eip0, sc1-eip0, etc.
+
+   Example:  We want to kickoff a 6-cpu run on 2 nodes,
+
+   ddikick.x gamess.x <jobname> -ddi 2 6 sc32:cpus=4:netext=-eip0 \
+     sc33:cpus=2:netext=-eip0 -scr <scrdir>
+
+2) You may have multiple high performance network interface cards (NIC)
+   within a single node.  To stripe the connections over the multiple
+   connections, .e.g. pl4.gig, pl4.gig2, pl4.gig, pl4.gig2, pl6.gig, ...
+   just add both extensions separated by a comma:
+
+   SCL IBM Power3 Cluster (4-way SMP with dual gigabit ethernet NICs),
+
+   ddikick.x gamess.x <jobname> -ddi 2 6 pl4:cpus=4:netext=.gig,.gig2 \
+     pl6:cpus=2:netext=.gig,.gig2 -scr <scrdir>
+
+3) You are using a multiprocessor desktop, e.g. any recent Apple
+computer is likely a dual processor.  You don't understand how to 
+set up System V memory, or how to generate ssh keys to permit ssh
+process generation, and Apple has hidden rsh very well.  You don't 
+have any intention of using more than your one desktop, but you'd 
+like to use it in parallel.  In this case, just repeat the special 
+hostname "localhost" once per processor, so to use both CPUs,
+       -ddi 2 2 localhost localhost
+The :cpus= flag works only with SystemV shared memory, and the 
+special names above dodge the ssh process generation issues.  This
+isn't as efficient as using SysV memory, but you don't have to make
+any system level changes to your computer.
+
+More examples can be found in the rungms script.
+
+NOTE: if ddikick.x or gamess.x are not in the users default login path,
+then the original command needs to specify the full path.
+
+/u1/ryan/gamess/ddikick.x /u1/ryan/gamess/gamess.65.x $JOBNAME -ddi ...
+
+                              * * *
+
+Remote process generation defaults to the tried-and-true Unix rsh command.
+For security reasons, many sites may prefer to use ssh instead of rsh to
+launch the processes.  If so, before ddikick.x, execute this
+   setenv DDI_RSH ssh
+if 'ssh' is on the path (or use the full path name of ssh).
+
+                    ---------------------------
+
+                     6. DDI running over SHMEM
+
+The SHMEM library, traditionally associated with Cray, is a programming
+library for one-side remote memory access.  The DDI programming model
+was developed around the SHMEM library and programming model.  The code
+is very similar to the original DDI implementation on the T3E, and it
+has been tested on various Cray and Compaq Supercluster systems.
+
+The SHMEM library on the SGI Origin is a highly mutated version of this,
+and is therefore implemented in a completely different source file from
+the standard SHMEM.  However, to users, ddi/shmem/ddishm.src and ddio3k.src
+will feel operationally the same.
+
+The SHMEM implementation does not support the concept of DDI groups.
+
+                    ---------------------------
+
+                     7. DDI running over LAPI
+
+On the IBM SP, the LAPI library allows for one-sided remote access with-
+out the need for data servers.  We have built a version of DDI based on
+LAPI to improve DDI performance on the SP.  This implementation uses both
+MPI and LAPI calls.  Intra-node messaging is done via SYSV memory calls,
+just as on any IBM SMP-based cluster.
+
+MPI is used for point-to-point and collective communications, while LAPI
+is used for distributed data operations.  Since the LAPI implementation
+does not require data server processes, the standard IBM kickoff program
+named poe (why didn't they call it toe?) is used to start GAMESS.
+
+Note that a script to submit GAMESS jobs to LoadLeveler batch queues is
+now included in the standard GAMESS distribution, ~/gamess/misc/llgms.
+You are advised to look into this, and the rungms script, to make sure
+the MPI and LAPI settings are appropriate for your SP Switch technology.
+
+In principal, DDI groups are supported, but this capability has not yet
+been tested (group code was added after SP testing was finished).
+
+                    ---------------------------
+
+                     8. DDI running over MPI
+
+This is fairly difficult.  MPI is a standard programming interface, so
+that you will not have to modify the source code of DDI.  However, each
+MPI implementation is different in terms of where it is installed, how
+many libraries it consists of, and worst of all, in how MPI processes
+are to be run.  It is quite impossible for the GAMESS scripts to handle
+all the various MPI implementations, so no attempt is made to do so.
+
+Many examples of how to modify the GAMESS installation scripts in order 
+to use MPI are provided below, to help you work out your system's MPI.
+Installation of MPI itself and configuration of your network device are
+clearly beyond the scope of this document.
+
+The situation is a bit better on high end machines, such as a IBM SP,
+where the MPI is expected to come from IBM itself.  Thus the control
+language with GAMESS will know where to find MPI (namely in the usual
+place IBM puts it).  In fact most high end machines will select their
+own favorite communication model automatically, so don't try to change
+them.
+
+If you are not comfortable with modifying scripts, looking for system
+libraries, and learning how to start MPI processes, please use the
+TCP/IP implementation and ddikick.x, see above.  Generally speaking,
+workstation class machines (and small clusters made from them) will
+default to using TCP/IP sockets to support DDI.  The compiling scripts 
+can easily find the system's TCP/IP libraries.  Chemists will find 
+that ddikick's command line, which is which is well documented in this
+file, and consistent from machine to machine, is much easier to use 
+than the numerous MPI kickoff programs.
+
+However, if your computer system has a better quality network than
+a simple Gigabit Ethernet (examples might be Infiniband or Myrinet),
+there will be better performance (meaning shorter wall clock times),
+by using MPI.  If you feel adventurous, can read and modify scripts, 
+and want to exploit a high quality network, there are lots of
+examples here.  Don't be afraid to keep going.
+
+            general words about the communication model
+
+Some network adapters are provided with specialized MPI libraries, and
+the vendors invariably describe them as low-latency and high-bandwidth.
+You can select the communication model "mpi" in the compddi script to
+use only MPI-1 calls, sending all traffic on this fast network.
+
+If the fast network allows for the coexistence of TCP/IP with the MPI,
+or if there's a second network such as FE or GE present to carry a
+small amount of TCP/IP traffic, you may like to try the "mixed" model.
+The "mixed" communication model is also selected in the compddi script.
+It will use a little bit of TCP/IP to avoid what is called polling in
+the MPI library.  In this case, almost all traffic, and 100% of the
+large messages, are sent by the MPI library, so the much ballyhooed
+performance of your network may really help!
+
+Many examples of running GAMESS with MPI are given below.  You will note
+that these are different!  While finding the include file mpi.h is
+generally easy, finding the right libraries to link against can be
+an order of magnitude harder.  But, that's not the real problem, for
+working out the way to execute is two orders of magnitude harder than
+the linking!
+
+            general words about execution
+
+Since MPI does not normally run two processes on every CPU, you
+must be sure to generate the 2nd set (the data servers), and place 
+them on the same CPU names as the 1st set (the compute processes).  
+They can actually be in any order, as DDI sorts the names internally, 
+before DDI assigns them to compute processes and data servers.  
+However, it is often convenient to put the compute processes first 
+and the data servers second, as shown in the examples.
+
+In real life, an MPI-based cluster will almost surely have some
+kind of batch program installed, in which the scheduler (PBS, etc.)
+assigns different names to each job.  To keep the examples simple,
+we will mostly ignore that below, and assume that you are using 
+exactly two nodes with fixed names.  See 'rungms' for some scripting 
+that will dice up a set of host names from a batch scheduler into 
+the right format to initiate MPI properly.  A few simple examples
+of using a scheduler's host list are shown.
+
+Unlike "mpirun" which is documented only in the man pages for the
+MPI version you are using, we can document what comes after the name
+of the GAMESS binary, for these are arguments to GAMESS/DDI (not the
+MPI kickoff program):
+        -scr /working/directory/path
+which is the working directory on each node for AO integral files, etc.
+        -netext NIC
+is a way to modify the placement of the TCP control messages, if
+you are using "mixed" instead of "mpi".  When using the "mixed"
+model, the processes are started on the appropriate nodes by the
+mpirun command, which should specify use of the faster adapter in
+the parallel machine.  By default, the small TCP/IP messages for
+the "mixed" model will travel on the network adapter specified by
+the "gethostname" call...which is also the result of 'hostname' at
+the command prompt.  You may wish to try moving these to the higher
+speed network, although this is not crucial.  For the 2nd example
+above, the result of "gethostname" is s1, s2, s3, ... for the
+cluster's Fast Ethernet adapters, and the Myrinet adapters are
+all named s1.myri, s2.myri, s3.myri.  Here "-netext .myri" will
+move the TCP/IP traffic onto the Myrinet.  There isn't that much
+flexibility here, all you can do is specify a suffix to be tacked
+on! If you can't do this, it isn't a big deal, since there is only
+a very small amount of TCP/IP in the "mixed" model.
+
+            general words about 'FGEhack'
+
+It is distressingly common to find MPI implementations in which the
+environment variables are not passed to the MPI processes, or in
+which this can be done only awkwardly.  The disk file names to be
+used by GAMESS must be conveyed to the first compute process (MPI
+rank 0), which always sends them by message to all other processes.
+In cases where it is impossible or hopelessly cumbersome to get
+the environment variables into the first process, they can be written
+into a disk file, by
+    env > $SCR/GAMESS.ENVIRON
+GAMESS must be told that the data is in this file (there is no
+flexibility in the file name!), by special compilation with the
+so-called "file get environment hack".  Edit 'comp' so that the
+value of FGEhack is 'true', then recompile iolib.src and unport.src,
+and then relink a binary.
+
+Technical notes: this mechanism only passes file names into GAMESS,
+since that is all GAMESS looks for in the file.  System variables 
+such as LD_LIBRARY_PATH or MKL_SERIAL must be conveyed using the 
+awkward mechanism provided by the MPI kickoff programs, but should 
+be relatively few in number.  In the event you are using subgroups,
+as in FMO calculations, the file GAMESS.ENVIRON must be copied to
+the master node for every subgroup.
+
+
+===== MPI Example #1:
+
+This example is two of SGI's XE210 blades, connected by a Voltaire
+Infiniband with Voltaire's IB adapters.  The low level libraries
+are from Mellanox, and the MPI runs on top of these libraries.
+
+The SGI blade contains two dual core "Woodcrest" Intel Xeon chips,
+at 3.0 GHz, and the compiler is Intel's ifort with the MKL library.
+A netpipe test on this system's Infiniband showed 1700 mbps bandwidth 
+using TCP/IP, also called IP over IB, but 7000 mbps using MPI.  Note
+that IB clearly bests GE, whose maximum speed would be 125 mbps.
+
+These SGI nodes actually do run faster using MPI (in the form of 
+the "mixed" model), for a MP2 energy run:
+                      RHF      MP2    job CPU job wall  efficiency
+               p=1   1461.0   5231.6   6699.6  6701.1  (99.98%) "sockets"
+               p=2    728.7   2765.5   3499.7  3530.6  (99.1%)  "sockets"
+               p=4    366.5   1748.0   2119.7  2152.6  (98.5%)  "sockets"
+      Gigabit  p=8    187.6    864.4   1057.1  2828.7  (37.4%)  "sockets"
+   Infiniband  p=8    186.6    982.0   1173.7  2022.1  (58.0%)  "sockets"
+   Infiniband  p=8    188.9    816.0   1010.2  1359.4  (74.3%)  "mixed"
+The test case was an organic molecule with exactly 500 AOs, 6-31G(d).
+Without using MPI, the p=8 run's wall clock time was hardly any better
+than the intranode p=4 time.
+
+    comp - You must use the "file get environment hack" in 'comp',
+           recompiling unport.src and iolib.src
+
+    compddi - select the communication model "mixed".
+              set MPI_INCLUDE_PATH = '-I/usr/voltaire/mpi.gcc.rsh/include'
+              repeat 'compddi', to build a libddi.a, but not a ddikick.x.
+
+    lked - set the environment variable MSG_LIBRARIES to
+               ../ddi/libddi.a \
+               -L/usr/voltaire/mpi.gcc.rsh/lib -lmpich \
+               -L/usr/mellanox/lib -lmtl_common -lvapi -lmosal -lmpga \
+               -lpthread
+
+    rungms - execute by a clause like below.  We'll let you make a
+             more general host list for your site's situation.  The
+             host names that our system wanted are the short ones,
+             somehow it knows to put them on the IB adapter anyway.
+
+if ($TARGET == mpi) then
+   #     note doubling of process count, compute process+data servers!
+   @ NPROCS = $NCPUS + $NCPUS
+   #
+   #     no attempt to use NCPUS here, which we take to be 8, and
+   #     to be spread over two 4-way nodes called "se" and "sb".
+   if (-e $SCR/$JOB.hostlist) rm $SCR/$JOB.hostlist
+   touch $SCR/$JOB.hostlist
+   echo se >> $SCR/$JOB.hostlist
+   echo se >> $SCR/$JOB.hostlist
+   echo se >> $SCR/$JOB.hostlist
+   echo se >> $SCR/$JOB.hostlist
+   echo sb >> $SCR/$JOB.hostlist
+   echo sb >> $SCR/$JOB.hostlist
+   echo sb >> $SCR/$JOB.hostlist
+   echo sb >> $SCR/$JOB.hostlist
+   #            then, put in data servers.
+   echo se >> $SCR/$JOB.hostlist
+   echo se >> $SCR/$JOB.hostlist
+   echo se >> $SCR/$JOB.hostlist
+   echo se >> $SCR/$JOB.hostlist
+   echo sb >> $SCR/$JOB.hostlist
+   echo sb >> $SCR/$JOB.hostlist
+   echo sb >> $SCR/$JOB.hostlist
+   echo sb >> $SCR/$JOB.hostlist
+#      Next is very clunky way to pass file names to 1st compute process.
+#      It requires that you compiled iolib and unport with the "FGE" hack.
+#      Since you can have only one file called GAMESS.ENVIRON on your
+#      first node, you can run only one GAMESS job at a time on it.
+   env >& $SCR/GAMESS.ENVIRON
+   chdir $SCR
+#
+   set echo
+   /usr/voltaire/mpi.gcc.rsh/bin/mpirun_rsh -noinput \
+        -np $NPROCS  -hostfile $SCR/$JOB.hostlist \
+        /se/mike/gamess/gamess.$VERNO.x -scr $SCR
+   unset echo
+#
+   rm $SCR/$JOB.hostlist
+   rm $SCR/GAMESS.ENVIRON
+endif
+
+
+===== MPI Example #2:
+
+This is very similar to the first example, using a TopSpin switch (this
+company was purchased by Cisco in 2005), connecting Dell-built Intel
+Woodcrest chip blades:
+
+comp: perform the "file get environment hack", recompile iolib and unport.
+
+compddi: use the "mixed" communication model, and
+     set MPI_INCLUDE_PATH = '-I/usr/local/topspin/mpi/mpich/include'
+
+lked: the linux-ia64 target's libraries become
+     set MSG_LIBRARIES='../ddi/libddi.a -lpthread \
+               -L/usr/local/topspin/mpi/mpich/lib64 -lmpich'
+
+rungms: the kickoff is done with
+#     list compute process and data servers from the batch queue's list
+   touch $SCR/$JOB.hostlist
+   foreach host ($LSB_HOSTS)
+      echo $host >> $SCR/$JOB.hostlist
+   end
+   foreach host ($LSB_HOSTS)
+      echo $host >> $SCR/$JOB.hostlist
+   end
+#
+   env >& $SCR/GAMESS.ENVIRON
+   chdir $SCR
+#
+   set echo
+   /usr/local/topspin/mpi/mpich/bin/mpirun_rsh -ssh -np $NPROCS \
+        -hostfile $SCR/$JOB.hostlist \
+        /home/mike/gamess/gamess.$VERNO.x -scr $SCR
+   unset echo
+#
+   rm $SCR/$JOB.hostlist
+   rm $SCR/GAMESS.ENVIRON
+
+Actually, this example has illustrated one way of using a batch queue's 
+host list.  In this case the LSB batch queue system provided the assigned 
+host names in a variable LSB_HOSTS.
+
+
+===== MPI Example #3:
+
+This example is an Athlon-based cluster running a version of Linux,
+with a Myrinet network, and Myrinet's flavor of MPICH, called GM.
+The path names for the include files, libraries, and kickoff program
+might be a choice by the person who set up our Linux system disk,
+as opposed to where GM is usually installed.
+
+    skip the "file get environment hack"
+
+    compddi -
+       a) choose "set COMM=mixed"   (better than "set COMM=mpi")
+       b) specify the location of the include file "mpi.h", in our
+          example, this is
+             set MPI_INCLUDE_PATH='-I/usr/local/mpich-gm/include'
+       c) repeat "compddi", which will build a libddi.a file that
+          expects to use MPI.  Of course this does not create a
+          ddikick.x (because MPI runs by its own kickoff program).
+
+    lked -
+       a) move your machine's case in the "switch" from the "sockets"
+          part to the "mpi" part, and give all necessary library names.
+          In the present example, this is two libraries for MPI, and
+          the system thread library, following DDI's library:
+                   ../ddi/libddi.a \
+                   /usr/local/mpich-gm/lib/libmpich.a \
+                   /usr/local/gm/lib/libgm.a -lpthread
+
+    rungms -
+       The MPI processes are started with the MPI kickoff program,
+       which is often spelled "mpirun", as here.  Note that the host
+       names and the process count are both doubled, so that both
+       compute processes and data servers are started.  Our example
+       system schedules jobs with the PBS batch manager, which puts
+       its assigned CPU/host names in a file, whose name is given in
+       environment variable PBS_NODEFILE.
+
+         @ NPROCS = $NCPUS + $NCPUS
+         cat $PBS_NODEFILE  > ~/scr/gms-hostlist.$JOB
+         cat $PBS_NODEFILE >> ~/scr/gms-hostlist.$JOB
+         set echo
+         /usr/local/mpich-gm/bin/mpirun.ch_gm -np $NPROCS \
+               -machinefile ~/scr/gms-hostlist.$JOB \
+               --gm-recv blocking \
+               $GMSPATH/gamess.$hw.$VERNO.x -scr $SCR -netext .myri
+         unset echo
+         rm -f ~/scr/gms-hostlist.$JOB
+
+
+===== MPI Example #4:
+
+Argonne's MPICH2, a nice implementation of MPI-2, see
+    http://www.mcs.anl.gov/research/projects/mpich2
+We tried version 1.0.7
+
+    comp: skip the "file get environment hack"
+    compddi:
+         set COMM="mixed"
+         set MPI_INCLUDE_PATH = '-I/opt/mpich2/gnu/include'
+    lked:
+         set MSG_LIBRARIES='../ddi/libddi.a \
+             -L/opt/mpich2/gnu/lib -lmpich -lrt -lpthread'
+    rungms:
+        examples 4-7 use two constant node names, compute-0-0 and compute-0-1
+        each of which is assumed to be SMP (ours are 8-ways):
+
+if ($TARGET == mpi) then
+   setenv HOSTFILE $SCR/$JOB.nodes.mpd
+   setenv PROCFILE $SCR/$JOB.processes.mpd
+   #
+   #   build HOSTFILE, saying which nodes will be in our MPI ring
+   #
+   if (-e $HOSTFILE) rm $HOSTFILE
+   touch $HOSTFILE
+   echo compute-0-0 >> $HOSTFILE
+   echo compute-0-1 >> $HOSTFILE
+   #
+   #   build PROCFILE, saying how many processes we will run, node by node.
+   #
+   if (-e $PROCFILE) rm $PROCFILE
+   touch $PROCFILE
+   if ($NCPUS == 1) then
+      setenv NNODES 1
+      @ NPROCS = $NCPUS + $NCPUS
+      echo "-n $NPROCS -host compute-0-0 /home/mike/gamess/gamess.$VERNO.x" >> $PROCFILE
+   else
+      setenv NNODES 2
+      @ NPROCS = $NCPUS
+      echo "-n $NPROCS -host compute-0-0 /home/mike/gamess/gamess.$VERNO.x" >> $PROCFILE
+      echo "-n $NPROCS -host compute-0-1 /home/mike/gamess/gamess.$VERNO.x" >> $PROCFILE
+   endif
+   setenv LD_LIBRARY_PATH /opt/mpich2/gnu/lib
+   setenv LD_LIBRARY_PATH $LD_LIBRARY_PATH:/opt/intel/mkl/10.0.3.020/lib/em64t
+   setenv MKL_SERIAL YES
+   set path=(/opt/mpich2/gnu/bin $path)
+   chdir $SCR
+   #     
+   #   bring up a 'ring' of MPI demons 
+   #     
+   set echo 
+   mpdboot -n $NNODES -f $HOSTFILE
+   #        
+   #   start the MPI-2 job.
+   #           
+   mpiexec -configfile $PROCFILE < /dev/null
+   #        
+   #   shut down the 'ring' of MPI demons
+   #
+   mpdallexit
+   unset echo
+   #    don't erase $HOSTFILE, it is used for cleaning scratch disks below
+   rm -f $PROCFILE
+endif
+
+
+===== MPI Example #5:
+
+Intel's MPI, available at their developers site (like ifort), which
+is based on Argonne's MPICH2.  Intel's impi provides professional
+level documentation.  We tried version 3.1, whose usage is almost
+exactly the same as MPICH2.
+
+    comp: skip the "file get environment hack"
+    compddi:
+         set COMM="mixed"
+         set MPI_INCLUDE_PATH = '-I/opt/intel/impi/3.1/include64'
+    lked:
+         set MSG_LIBRARIES='../ddi/libddi.a \
+             -L/opt/intel/impi/3.1/lib64 -lmpi -lmpigf -lmpigi -lrt -lpthread'
+    rungms:
+         since this is based on Argonne's MPICH2, it is largely the
+         same as above.  Library path and binary path are different,
+         of course.  We found it necessary to specify ssh as the
+         remote shell launcher to be used.  The part which differs is:
+
+setenv LD_LIBRARY_PATH /opt/intel/impi/3.1/lib64
+setenv LD_LIBRARY_PATH $LD_LIBRARY_PATH:/opt/intel/mkl/10.0.3.020/lib/em64t
+setenv MKL_SERIAL YES 
+set path=(/opt/intel/impi/3.1/bin64 $path)
+chdir $SCR
+#
+#   bring up a 'ring' of MPI demons
+#
+set echo
+mpdboot --rsh=ssh -n $NNODES -f $HOSTFILE
+#    
+#   start the MPI-2 job.
+#   use    setenv I_MPI_DEBUG 2       to print the adapter chosen
+#   other interesting I_MPI_XXX are in Intel's professional grade docs
+mpiexec -configfile $PROCFILE < /dev/null
+#
+#   shut down the 'ring' of MPI demons
+#
+mpdallexit
+unset echo
+       
+
+===== MPI Example #6:
+
+Another MPI-2 implementation, see http://www.open-mpi.org.  The machine
+we tried had version 1.2.6, which did not run our dynamic load balance
+counters correctly.  Runs with static balancing (BALTYP=LOOP) did work.
+As of this writing, we do not know if newer versions of OpenMPI (which
+do exist) will work with DLB.
+
+    comp: skip the "file get environment hack"
+    compddi:
+         set COMM="mixed"
+         set MPI_INCLUDE_PATH = '-I/usr/mpi/gcc/openmpi-1.2.6/include'
+    lked:
+         set MSG_LIBRARIES='../ddi/libddi.a \
+             -L/usr/mpi/gcc/openmpi-1.2.6/lib64 -lmpi -lpthread'
+    rungms:
+
+if ($TARGET == mpi) then
+   #   remember, data servers double the number of MPI processes
+   #   but of course do not double the number of cores $NCPUS.
+   @ NPROCS = $NCPUS + $NCPUS
+   #
+   #   build HOSTFILE, specifying node and process counts
+   #
+   setenv HOSTFILE $SCR/$JOB.hostfile
+   if (-e $HOSTFILE) rm $HOSTFILE
+   touch $HOSTFILE
+   #
+   if ($NCPUS == 1) then
+      setenv NNODES 1
+      echo compute-0-0 slots=$NCPUS max-slots=$NPROCS >> $HOSTFILE
+   else
+   #    next puts compute processes on 0-0 and 0-1
+   #          and data servers      on 0-0 and 0-1,
+   #    the arithmetic is specific to two nodes only!!!
+      setenv NNODES 2
+      @ NHALF = $NCPUS / 2
+      echo compute-0-0 slots=$NHALF  >> $HOSTFILE
+      echo compute-0-1 slots=$NHALF  >> $HOSTFILE
+      echo compute-0-0 slots=$NHALF  >> $HOSTFILE
+      echo compute-0-1 slots=$NHALF  >> $HOSTFILE
+   endif
+   #
+   setenv LD_LIBRARY_PATH /opt/intel/mkl/10.0.3.020/lib/em64t
+   setenv MKL_SERIAL YES
+   chdir $SCR
+   #     
+   #   start the OpenMPI job.
+   #   the path name in front of mpirun is sufficient to locate the
+   #   openmpi libs, so they are not in LD_LIBRARY_PATH
+   #        
+   set echo 
+   /usr/mpi/gcc/openmpi-1.2.6/bin/mpirun -np $NPROCS --hostfile $HOSTFILE /home/mike/gamess/gamess.$VERNO.x
+   unset echo
+endif
+
+
+===== MPI Example #7:
+
+MVAPICH, using version 1.0.1, see
+    http://mvapich.cse.ohio-state.edu
+There is a MPI-2 implementation called MVAPICH2 at this site, but as
+of this writing, we have not had a chance to try it.
+
+For the same test as used in example #1, using Dell nodes with two 
+quad-core Harperton 3.0 GHz chips, and a XXXX Infiniband:
+                      RHF      MP2    job CPU job wall  efficiency
+               p=1   1341.7   4022.8   5372.3  5372.3  (100%)
+               p=2    685.3   2286.4   2978.3  3038.8  (98.0%)
+               p=4    345.5   1211.7   1563.2  1619.6  (96.5%)
+               p=8    173.0    710.0    888.5   953.6  (93.2%)
+               p=16    87.7    422.8    516.3   988.8  (52.2%)
+The dropoff in wall clock scaling between p=8 (meaning 4+4) and 
+p=16 (8+8) is mainly due to data servers being forced to run on the 
+same cores as the compute processes in the latter case, and to some
+extent to doubling network congestion on the single Infiniband. 
+Runs that do not use MEMDDI will take no such hit when the data
+servers (which have almost nothing to do) co-occupy the same cores.
+
+    comp: do the "file get environment hack", recompile iolib and unport
+    compddi:
+         set COMM="mixed"
+         set MPI_INCLUDE_PATH = '-I/usr/mpi/gcc/mvapich-1.0.1/include'
+    lked:
+         set MSG_LIBRARIES='../ddi/libddi.a \
+             -L/usr/mpi/gcc/mvapich-1.0.1/lib -lmpich -libverbs -libumad \
+             -lpthread'
+    rungms:
+         the 'env' line below completes the "FGEhack"!
+
+if ($TARGET == mpi) then
+   #   remember, data servers double the number of MPI processes
+   #   but of course do not double the number of cores $NCPUS.
+   @ NPROCS = $NCPUS + $NCPUS
+   #
+   #     The next line is just a convenient way to hardwire our two
+   #     names, the goal here is to prepare a disk file with one line
+   #     per name to feed to the MPI kickoff program.
+   set HOSTLIST=(compute-0-0 compute-0-1)
+   #
+   #   build HOSTFILE, specifying node and process counts
+   #
+   setenv HOSTFILE $SCR/$JOB.hostfile
+   if (-e $HOSTFILE) rm $HOSTFILE
+   touch $HOSTFILE
+   #
+   if ($NCPUS == 1) then
+   #      start one compute process and one data server
+      echo $HOSTLIST[1] >> $HOSTFILE
+      echo $HOSTLIST[1] >> $HOSTFILE
+   else
+   @ NHALF = $NCPUS / 2
+   #          place the compute processes first...
+   @ nh=1
+   @ nhosts=$#HOSTLIST 
+   while ($nh <= $nhosts)
+      @ np=1
+      while ($np <= $NHALF)
+         echo $HOSTLIST[$nh] >> $HOSTFILE
+         @ np++
+      end
+      @ nh++
+   end
+   #          ...and then, lay down the data servers.
+   @ nh=1
+   @ nhosts=$#HOSTLIST
+   while ($nh <= $nhosts)
+      @ np=1
+      while ($np <= $NHALF)
+         echo $HOSTLIST[$nh] >> $HOSTFILE
+         @ np++
+      end
+      @ nh++
+   end
+   endif
+   #          
+   setenv LD_LIBRARY_PATH /opt/intel/mkl/10.0.3.020/lib/em64t
+   chdir $SCR
+   #
+   #  Next is a clunky way to pass file names (only) to 1st compute process,
+   #  other variable=value env. variables are given before the binary name.
+   #
+   env >& $SCR/GAMESS.ENVIRON
+   #
+   set echo
+   /usr/mpi/gcc/mvapich-1.0.1/bin/mpirun_rsh -ssh \
+        -np $NPROCS  -hostfile $HOSTFILE \
+        MKL_SERIAL=YES \
+        /home/mike/gamess/gamess.$VERNO.x -scr $SCR < /dev/null
+   unset echo
+   #
+   #        leave $HOSTFILE to be used by file cleanup below
+   rm -f $SCR/GAMESS.ENVIRON
+endif
+
+
+                    ---------------------------
+
+                    9. DDI running on the IBM Blue Gene
+
+The IBM Blue Gene/L GAMESS port uses ARMCI for one-sided communication, 
+which is better than the alternative data-server model using MPI-1.
+
+When compiling ddi, set MAXNODES to the total number of processors,
+in all frames, which differs from this value's usual definition.  
+Set MAXCPUS to 1.  The BG/L is not a uniprocessor, but DDI is to be 
+compiled as if it were.
+
+This is an unusual machine, and the rest of its documentation can
+be found in ~/gamess/misc/ibm-bg subdirectory, rather than here.
+
+                    ---------------------------
+
+                    10. fallback to original DDI code
+
+   It is entirely possible that future additions to the newer version of
+DDI will someday make it impossible to use the old version.  However, at
+present the old version works, just a bit more slowly, although the "group"
+concept is not supported at all.  It may be useful to use the old version
+if you are unable to reset System V memory values correctly, or if you
+have a very old operating system.  Steps are:
+     1) set DDI_SOURCE=old in compddi, use this to compile DDI.
+     2) relink GAMESS.  No changes are necessary in 'lked'.
+     2) edit the rungms script to support the old ddikick.x
+
+The old ddikick's command to fire up GAMESS is
+     ddikick.x Inputfile Exepath Exename Scratchdir \
+        Nhosts Hostname_0 Hostname_1 ... Hostname_N-1
+
+    The Inputfile name is not actually used, but it will be displayed
+by the 'ps' command so you can tell what is actually being run.
+
+    Exepath is the name of the directory that contains the program to
+be executed.  Exename is the name of the GAMESS executable.  The best
+case is to have Exepath in an NFS mounted partition that all nodes can
+access, so that you have only one copy of the big GAMESS executable.
+However, you could carefully FTP a copy to all nodes using always exactly
+the same file name, such as /usr/local/bin/gamess.01.x.
+
+    Scratchdir is the name of a large working disk space, which must be
+the same on all nodes, in which all temporary files are placed.
+
+    Nhosts is the number of compute processes to be run.  If you want
+to run sequentially, just ensure Nhosts is 1.  The first host, Hostname_0,
+is the "master node", which handles reading the one input file, and
+writing the one output file.  This host must be the same host that is
+executing the 'rungms' script, or else the environment variables that
+define the files don't get properly accepted.  Supply a total of Nhosts
+Hostnames.  One compute process will be started on each of these (with
+ranks 0,1,...Nhosts-1), and then one data server will be run on each
+as well (for a total of 2 times Nhosts processes).  If you have SMP
+systems, such as a four processor machine, set Nhosts=4, and repeat its
+Hostname a total of 4 times.

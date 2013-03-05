@@ -1,0 +1,1567 @@
+C  8 FEB 08 - HPTI- DDI_PBEG: Commented out START_PES 
+C 19 Dec 06 - MWS - add GET/PUT/ACC_COMM routines
+C 19 Nov 06 - MWS - add routines to satisfy external refs for DDI V3
+C 29 May 06 - MWS - change comments about use on Altix (only comments)
+C 12 Aug 05 - MWS - add (as comments) Martin Hilgeman's Altix shmem.fh
+C 30 Apr 05 - MWS - modify DDI_LEVEL to return implementation value
+C 31 Jan 05 - MWS - add SEND/RECV
+C 29 Jul 04 - MWS - add IRECV/ISEND/WAIT, add PROCDLB/GETACC, dummy GDDI
+C 11 DEC 01 - GDF - INTEGER*8 DEFAULT, SHMEM ARGS CAST TO INTEGER*4
+C 15 AUG 00 - MWS - DDI_MEMORY: CONVERT MWORDS TO WORDS
+C 28 JUL 00 - MWS - DDI_MEMORY: FIX CHECK JOBS
+C 25 OCT 99 - MWS - DDI_CREATE: REMOVE EXTRANEOUS JCHUNK ARGUMENT
+C  6 JUN 99 - MWS - PBEG,PEND,MEMORY: CHANGE CALLING ARGS.
+C  9 APR 99 - GDF - NEW MODULE FOR DISTRIBUTED DATA INTERFACE OVER SHMEM
+C
+C<><><><><><><><>  DISTRIBUTED DATA INTERFACE  <><><><><><><><>
+C<><><><><><><><>    WRITTEN BY G. FLETCHER    <><><><><><><><>
+C
+C    GLOBAL TASKS
+C
+C       DDI_PBEG      :  INITIALIZE DDI PARAMETERS
+C       DDI_PEND      :  MAKE TIDY EXIT
+C       DDI_MEMORY    :  CREATE SHARED MEMORY REGION
+C       DDI_CREATE    :  CREATE DISTRIBUTED MATRIX
+C       DDI_DESTROY   :  DESTROY DISTRIBUTED MATRIX
+C       DDI_DLBRESET  :  RESET DLB TASK COUNTER
+C       DDI_BCAST     :  BROADCAST DATA TO ALL NODES
+C       DDI_GSUMF     :  REAL*8 GLOBAL SUM
+C       DDI_GSUMI     :  INTEGER GLOBAL SUM
+C       DDI_SYNC      :  BARRIER SYNCHRONIZATION
+C
+C    POINT-TO-POINT TASKS
+C
+C       DDI_GET       :  GET BLOCK OF MATRIX
+C       DDI_PUT       :  PUT BLOCK OF MATRIX
+C       DDI_ACC       :  ACCUMULATE DATA INTO BLOCK
+C       DDI_DLBNEXT   :  GET NEXT DLB TASK INDEX
+C
+C<><><><><><><><>  IMPLEMENTATION FOR SGI ORIGIN 3000  <><><><><><><><>
+C
+C  TRUE SPMD ONE-SIDED REMOTE DATA ACCESS
+C  TRANSPORT LAYER IS SHMEM
+C
+C*MODULE DDIO3K  *DECK DDI_LEVEL
+      SUBROUTINE DDI_LEVEL(IMPLEMENTATION)
+      INTEGER IMPLEMENTATION
+C
+C         0 means serial
+C         1 means distributed memory, but no subgroups
+C         2 means distributed memory, and subgroups (full version)
+C
+      IMPLEMENTATION = 1
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_PBEG
+      SUBROUTINE DDI_PBEG(NWDVAR)
+C
+C  -------------------------------------------------------------------
+C  INITIALISE PARAMETERS
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+      INTEGER NWDVAR, J,I
+C
+      INTEGER MAXDM,MAXPROC, NROW,CMAP
+     *,       MEMDM,DDIADDR,NDM
+      INTEGER*4 DLB_COUNTER,DDILOCK
+      PARAMETER ( MAXDM = 20, MAXPROC = 1024 )
+      COMMON /DDINFO/ NROW(MAXDM),CMAP(0:MAXPROC,MAXDM)
+     *,               MEMDM(MAXDM),DDIADDR(MAXDM)
+     *,               NDM,DLB_COUNTER,DDILOCK
+C
+C gdf:  11/21/01  control output of log messages
+C
+C
+      LOGICAL DDI_PRT
+      COMMON /DDIFLG/ DDI_PRT
+C
+      INTEGER*4 IZERO
+      PARAMETER ( IZERO=0 )
+C
+C        /usr/include/mpif.h contains declarations of just "INTEGER".
+C        When we compile these using f77 -i8, we get 8 byte quanties,
+C        which we cannot pass to MPI calls.  All integers in MPI calls
+C        appear to be required to be INTEGER*4 type, and therefore
+C        we must define parameters ourselves.  Fortunately, there are
+C        relatively few things needed from mpif.h, so we can just type
+C        them and initialize them ourselves (see below).  This could
+C        be tricky, if SGI ever changes their mpif.h, we must update!
+C
+C---  INCLUDE 'mpif.h'
+      INTEGER*4 IERROR
+C
+C        MPI is now used to implement DDI_ISEND/DDI_IRECV/DDI_WAIT
+C
+C     Calls to both START_PES and MPI_INIT are not needed
+C     with recent versions of the SGI MPT on the Altix
+C      CALL START_PES(IZERO)
+      CALL MPI_INIT( IERROR )
+C
+C  INITIALISE NUMBER OF DISTRIBUTED MATRICES (DM) TO ZERO
+C
+      NDM = 0
+      DO J = 1, MAXDM
+        DDIADDR(J) = 0
+      END DO
+      DLB_COUNTER = -1
+      DDILOCK     = -99
+C
+C gdf:  11/21/01  set default for output of log messages
+C
+      DDI_PRT = .TRUE.
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_PEND
+      SUBROUTINE DDI_PEND(ISTAT)
+      INTEGER ISTAT
+C        see note where MPI is opened about why we can't INCLUDE here.
+C---  INCLUDE 'mpif.h'
+      INTEGER*4 MPI_COMM_WORLD
+      PARAMETER (MPI_COMM_WORLD=1)
+      INTEGER*4 IERROR
+C
+C        nothing to do to end SHMEM, but must close MPI library
+C
+      CALL MPI_BARRIER(MPI_COMM_WORLD, IERROR)
+      CALL MPI_FINALIZE(IERROR)
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_MEMORY
+      SUBROUTINE DDI_MEMORY( MEMORY, MEMDDI , EXETYP)
+C
+C  -------------------------------------------------------------------
+C  INCLUDED FOR COMPATIBILITY WITH DATA-SERVER DDI
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+      INTEGER MEMORY, MEMDDI, DDI_NP, DDI_ME
+      REAL*8 EXETYP, TEMP
+C
+      CALL DDI_NPROC( DDI_NP, DDI_ME )
+C
+C     MEMDDI AGGREGATE TOTAL IN MWORDS IS NOW PARTITIONED INTO EACH
+C     NODE'S SHARE, THEN CONVERTED TO WORDS, IN ORDER TO AVOID 32 BIT
+C     OVERFLOWING PROBLEMS.
+C
+      TEMP = MEMDDI
+      TEMP = 1.0D+06 * (TEMP/DDI_NP)
+      MEMDDI = INT(TEMP)
+      RETURN
+      END
+C
+C gdf:  11/21/01  interface for switching log messages
+C
+C*MODULE DDIO3K  *DECK DDI_OUTPUT
+      SUBROUTINE DDI_OUTPUT(DDI_ON_OFF)
+C
+C  -------------------------------------------------------------------
+C  TOGGLE MESSAGES FROM DDI_CREATE,DDI_DESTROY
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+      LOGICAL DDI_ON_OFF, DDI_PRT
+      COMMON /DDIFLG/ DDI_PRT
+C
+      DDI_PRT = DDI_ON_OFF
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_CREATE
+      SUBROUTINE DDI_CREATE(IDIM,JDIM,HANDLE)
+C
+C  -------------------------------------------------------------------
+C  DISTRIBUTED DATA STRUCTURE OF REAL*8 TYPE
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+      INTEGER         IR,IW,IP,IS,IPK,IDAF,NAV,IODA
+      COMMON /IOFILE/ IR,IW,IP,IS,IPK,IDAF,NAV,IODA(950)
+C
+      INTEGER MAXDM,MAXPROC, NROW,CMAP
+     *,       MEMDM,DDIADDR,NDM
+      INTEGER*4 DLB_COUNTER,DDILOCK
+      PARAMETER ( MAXDM = 20, MAXPROC = 1024 )
+      COMMON /DDINFO/ NROW(MAXDM),CMAP(0:MAXPROC,MAXDM)
+     *,               MEMDM(MAXDM),DDIADDR(MAXDM)
+     *,               NDM,DLB_COUNTER,DDILOCK
+C
+      INTEGER IDIM,JDIM,HANDLE,LOADFM
+     *,       MINCOL,LFTCOL,ICOL,I
+     *,       ILOC,IHIC,JLOC,JHIC,MEMORY,DDI_NP,DDI_ME
+C
+C gdf:  11/21/01  flag for printing messages to log file
+C
+C
+      LOGICAL DDI_PRT
+      COMMON /DDIFLG/ DDI_PRT
+C
+      CALL DDI_NPROC( DDI_NP, DDI_ME )
+      NDM          = NDM + 1
+      HANDLE       = NDM
+      NROW(HANDLE) = IDIM
+C
+C  DETERMINE THE `COLUMN' DISTRIBUTION
+C
+      MINCOL = JDIM/DDI_NP        ! MINIMUM NO. COLUMNS PER NODE
+      LFTCOL = MOD(JDIM,DDI_NP)   ! LEFT-OVER COLUMNS
+C
+C  GENERATE THE COLUMN-NODE MAPPING
+C
+      ICOL = 1
+      DO I = 0 , DDI_NP
+        CMAP(I,HANDLE) = ICOL
+        ICOL = ICOL + MINCOL
+        IF ( I .LT. LFTCOL ) ICOL = ICOL + 1
+      END DO
+C
+C  ALLOCATE MEMORY OFF SYMMETRIC HEAP AND STORE ADDRESS IN DDIADDR
+C
+      CALL DDI_DISTRIB(HANDLE,DDI_ME,ILOC,IHIC,JLOC,JHIC)
+      MEMORY = (IHIC - ILOC + 1)*(JHIC - JLOC + 1)
+      CALL DDI_GMAXI(3000,MEMORY,1)
+      CALL DDI_SHPALLOC(DDIADDR(HANDLE),MEMORY)
+C
+C  SYNC
+C
+      CALL SHMEM_BARRIER_ALL
+C
+C gdf:  11/21/01  modify statement below
+C
+C      IF ( DDI_ME .EQ. 0 ) WRITE(IW,9000) HANDLE,IDIM,JDIM
+C
+      IF (DDI_ME.EQ.0.AND.DDI_PRT) WRITE(IW,9000) HANDLE,IDIM,JDIM
+C
+C  INITIALIZE TO ZERO
+C
+      CALL DDI_ZERO(HANDLE)
+      RETURN
+9000  FORMAT(6X,'DDI_CREATE: [',1I2,'] SIZE: ',1I8,' BY ',1I8)
+      END
+C*MODULE DDIO3K  *DECK DDI_DISTRIB
+      SUBROUTINE DDI_DISTRIB(HANDLE,NODE,ILOC,IHIC,JLOC,JHIC)
+C
+C  -------------------------------------------------------------------
+C  QUERY THE DISTRIBUTION OF A DM
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+C
+      INTEGER MAXDM,MAXPROC, NROW,CMAP
+     *,       MEMDM,DDIADDR,NDM
+      INTEGER*4 DLB_COUNTER,DDILOCK
+      PARAMETER ( MAXDM = 20, MAXPROC = 1024 )
+      COMMON /DDINFO/ NROW(MAXDM),CMAP(0:MAXPROC,MAXDM)
+     *,               MEMDM(MAXDM),DDIADDR(MAXDM)
+     *,               NDM,DLB_COUNTER,DDILOCK
+C
+      INTEGER HANDLE,NODE,ILOC,IHIC,JLOC,JHIC
+C
+      ILOC = 1
+      IHIC = NROW(HANDLE)
+      JLOC = CMAP( NODE  , HANDLE )
+      JHIC = CMAP( NODE+1, HANDLE ) - 1
+      RETURN
+      END
+C*MODULE DDISHM   *DECK DDI_NDISTRIB
+      SUBROUTINE DDI_NDISTRIB(HANDLE,NODE,ILOC,IHIC,JLOC,JHIC)
+      IMPLICIT NONE
+      INTEGER  HANDLE, NODE, ILOC, IHIC, JLOC, JHIC
+C
+C        JUST MAP THIS ONTO UNIPROCESSOR'S DISTRIBUTION
+C
+      CALL DDI_DISTRIB(HANDLE,NODE,ILOC,IHIC,JLOC,JHIC)
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_DESTROY
+      SUBROUTINE DDI_DESTROY(HANDLE)
+C
+C  -------------------------------------------------------------------
+C  DESTROY A DM - MUST BE DONE IN REVERSE ORDER TO THE CREATE'S
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+      INTEGER         IR,IW,IP,IS,IPK,IDAF,NAV,IODA
+      COMMON /IOFILE/ IR,IW,IP,IS,IPK,IDAF,NAV,IODA(950)
+C
+      INTEGER MAXDM,MAXPROC, NROW,CMAP
+     *,       MEMDM,DDIADDR,NDM
+      INTEGER*4 DLB_COUNTER,DDILOCK
+      PARAMETER ( MAXDM = 20, MAXPROC = 1024 )
+      COMMON /DDINFO/ NROW(MAXDM),CMAP(0:MAXPROC,MAXDM)
+     *,               MEMDM(MAXDM),DDIADDR(MAXDM)
+     *,               NDM,DLB_COUNTER,DDILOCK
+C
+      INTEGER HANDLE, DDI_NP, DDI_ME
+C
+C gdf:  11/21/01  flag for printing messages to log file
+C
+C
+      LOGICAL DDI_PRT
+      COMMON /DDIFLG/ DDI_PRT
+C
+C  SYNC TO ENSURE ENTIRE SHARED MEMORY REGION IS UNUSED
+C  BEFORE REMOVING IT.
+C
+      CALL DDI_SYNC( 100475+HANDLE )
+      NDM = NDM - 1
+C
+C  FREE MEMORY
+C
+      CALL DDI_SHPDEALLC(DDIADDR(HANDLE))
+C
+C  ANNOUNCE
+C
+      CALL DDI_NPROC( DDI_NP, DDI_ME )
+C
+C gdf:  11/21/01  modify statement below
+C
+C      IF ( DDI_ME .EQ. 0 ) WRITE(IW,9000) HANDLE
+C
+      IF (DDI_ME.EQ.0.AND.DDI_PRT) WRITE(IW,9000) HANDLE
+      RETURN
+9000  FORMAT(6X,'DDI_DESTROY: [',1I2,'] ')
+      END
+C*MODULE DDIO3K  *DECK DDI_GET
+      SUBROUTINE DDI_GET(HANDLE,ILO,IHI,JLO,JHI,BUFF)
+C
+C  -------------------------------------------------------------------
+C  COPY A PATCH OF A DM FROM THE SHARED REGION
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+C
+      INTEGER MAXDM,MAXPROC, NROW,CMAP
+     *,       MEMDM,DDIADDR,NDM
+      INTEGER*4 DLB_COUNTER,DDILOCK
+      PARAMETER ( MAXDM = 20, MAXPROC = 1024 )
+      COMMON /DDINFO/ NROW(MAXDM),CMAP(0:MAXPROC,MAXDM)
+     *,               MEMDM(MAXDM),DDIADDR(MAXDM)
+     *,               NDM,DLB_COUNTER,DDILOCK
+C
+      INTEGER HANDLE,ILO,IHI,JLO,JHI
+     *,       NSUBPATCH,NODEOFF,ILOSP(MAXPROC)
+     *,       IHISP(MAXPROC),JLOSP(MAXPROC),JHISP(MAXPROC)
+     *,       ILOC,IHIC,JLOC,JHIC,IDIM
+     *,       ILSP,IHSP,JLSP,JHSP,ILEN,JLEN
+     *,       NODE,IXOFF,IBOFF,ISP,DDI_NP,DDI_ME,J
+      REAL*8 BUFF(*)
+C
+      CALL DDI_NPROC( DDI_NP, DDI_ME )
+      CALL DDI_SUBPATCH(HANDLE,ILO,IHI,JLO,JHI
+     *,                 NSUBPATCH, NODEOFF
+     *,                 ILOSP, IHISP, JLOSP, JHISP )
+C
+C  LOOP OVER SUB-PATCHES
+C
+      IBOFF  = 1
+      DO ISP = 1 , NSUBPATCH
+        ILSP = ILOSP(ISP)
+        IHSP = IHISP(ISP)
+        JLSP = JLOSP(ISP)
+        JHSP = JHISP(ISP)
+        NODE = ISP + NODEOFF
+        ILEN = IHSP - ILSP + 1
+        JLEN = JHSP - JLSP + 1
+        CALL DDI_DISTRIB(HANDLE,NODE,ILOC,IHIC,JLOC,JHIC)
+        IDIM = IHIC - ILOC + 1
+        IXOFF= 1 +                           !   OFFSET TO
+     *         (JLSP - JLOC)*IDIM      +   !   START OF
+     *         (ILSP - ILOC)               !   SUBPATCH
+C
+C  REMOTE GET
+C
+        IF (ILEN.EQ.1) THEN  !  USE STRIDED GET
+            CALL DDI_DOUBLE_IGET(BUFF,IBOFF,DDIADDR(HANDLE),IXOFF
+     *,                     1,IDIM,JLEN,NODE)
+            IBOFF = IBOFF + JLEN
+        ELSE
+            DO J = JLSP , JHSP
+              CALL DDI_DOUBLE_GET(BUFF,IBOFF,DDIADDR(HANDLE),IXOFF
+     *,                           ILEN,NODE)
+              IXOFF = IXOFF + IDIM
+              IBOFF = IBOFF + ILEN
+            END DO
+        END IF
+      END DO
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_SUBPATCH
+      SUBROUTINE DDI_SUBPATCH(HANDLE,ILO,IHI,JLO,JHI
+     *,                       NSUBPATCH, NODEOFF
+     *,                       ILOSP, IHISP, JLOSP, JHISP )
+C
+C  -------------------------------------------------------------------
+C  SPLIT PATCH INTO NODAL SUBPATCHES
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+      INTEGER HANDLE,ILO,IHI,JLO,JHI
+     *,       NSUBPATCH,NODEOFF
+     *,       ILOSP(*),IHISP(*),JLOSP(*),JHISP(*)
+     *,       ILOC,IHIC,JLOC,JHIC,I, DDI_NP,DDI_ME
+C
+      CALL DDI_NPROC( DDI_NP, DDI_ME )
+      NSUBPATCH = 0
+      DO I = 0 , DDI_NP-1
+        CALL DDI_DISTRIB(HANDLE,I,ILOC,IHIC,JLOC,JHIC)
+        IF (JLOC.GT.JHI.OR.JHIC.LT.JLO) THEN
+C
+C  PATCH DOES NOT OVERLAP WITH THIS NODE
+C
+        ELSE
+          NSUBPATCH = NSUBPATCH + 1
+          IF (NSUBPATCH.EQ.1) NODEOFF = I-1
+          IF (JLO.GT.JLOC) THEN
+            JLOSP(NSUBPATCH) = JLO
+          ELSE
+            JLOSP(NSUBPATCH) = JLOC
+          END IF
+          IF (JHIC.GT.JHI) THEN
+            JHISP(NSUBPATCH) = JHI
+          ELSE
+            JHISP(NSUBPATCH) = JHIC
+          END IF
+          ILOSP(NSUBPATCH) = ILO
+          IHISP(NSUBPATCH) = IHI
+        END IF
+      END DO
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_PUT
+      SUBROUTINE DDI_PUT(HANDLE,ILO,IHI,JLO,JHI,BUFF)
+C
+C  -------------------------------------------------------------------
+C  COPY A PATCH OF A DM TO THE SHARED REGION
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+C
+      INTEGER MAXDM,MAXPROC, NROW,CMAP
+     *,       MEMDM,DDIADDR,NDM
+      INTEGER*4 DLB_COUNTER,DDILOCK
+      PARAMETER ( MAXDM = 20, MAXPROC = 1024 )
+      COMMON /DDINFO/ NROW(MAXDM),CMAP(0:MAXPROC,MAXDM)
+     *,               MEMDM(MAXDM),DDIADDR(MAXDM)
+     *,               NDM,DLB_COUNTER,DDILOCK
+C
+      INTEGER HANDLE,ILO,IHI,JLO,JHI
+     *,       NSUBPATCH,NODEOFF,ILOSP(MAXPROC)
+     *,       IHISP(MAXPROC),JLOSP(MAXPROC),JHISP(MAXPROC)
+     *,       ILOC,IHIC,JLOC,JHIC,IDIM
+     *,       ILSP,IHSP,JLSP,JHSP,ILEN,JLEN
+     *,       NODE,IXOFF,IBOFF,ISP,DDI_NP,DDI_ME,J
+      REAL*8 BUFF(*)
+C
+      CALL DDI_NPROC( DDI_NP, DDI_ME )
+      CALL DDI_SUBPATCH(HANDLE,ILO,IHI,JLO,JHI
+     *,                 NSUBPATCH, NODEOFF
+     *,                 ILOSP, IHISP, JLOSP, JHISP )
+C
+C  LOOP OVER SUB-PATCHES
+C
+      IBOFF  = 1
+      DO ISP = 1 , NSUBPATCH
+        ILSP = ILOSP(ISP)
+        IHSP = IHISP(ISP)
+        JLSP = JLOSP(ISP)
+        JHSP = JHISP(ISP)
+        NODE = ISP + NODEOFF
+        ILEN = IHSP - ILSP + 1
+        JLEN = JHSP - JLSP + 1
+        CALL DDI_DISTRIB(HANDLE,NODE,ILOC,IHIC,JLOC,JHIC)
+        IDIM = IHIC - ILOC + 1
+        IXOFF= 1 +                         !   OFFSET TO
+     *         (JLSP - JLOC)*IDIM      +   !   START OF
+     *         (ILSP - ILOC)               !   SUBPATCH
+C
+C  REMOTE PUT
+C
+        IF (ILEN.EQ.1) THEN  !  USE STRIDED PUT
+            CALL DDI_DOUBLE_IPUT(DDIADDR(HANDLE),IXOFF,BUFF,IBOFF
+     *,                     IDIM,1,JLEN,NODE)
+            IBOFF = IBOFF + JLEN
+        ELSE
+            DO J = JLSP , JHSP
+              CALL DDI_DOUBLE_PUT(DDIADDR(HANDLE),IXOFF
+     *,                             BUFF,IBOFF,ILEN,NODE)
+              IXOFF = IXOFF + IDIM
+              IBOFF = IBOFF + ILEN
+            END DO
+        END IF
+      END DO
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_ACC
+      SUBROUTINE DDI_ACC(HANDLE,ILO,IHI,JLO,JHI,BUFF)
+C
+C  -------------------------------------------------------------------
+C  ACCUMULATE DATA INTO A PATCH OF A DM
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+C
+      INTEGER MAXDM,MAXPROC, NROW,CMAP
+     *,       MEMDM,DDIADDR,NDM
+      INTEGER*4 DLB_COUNTER,DDILOCK
+      PARAMETER ( MAXDM = 20, MAXPROC = 1024 )
+      COMMON /DDINFO/ NROW(MAXDM),CMAP(0:MAXPROC,MAXDM)
+     *,               MEMDM(MAXDM),DDIADDR(MAXDM)
+     *,               NDM,DLB_COUNTER,DDILOCK
+C
+      INTEGER HANDLE,ILO,IHI,JLO,JHI
+     *,       NSUBPATCH,NODEOFF,ILOSP(MAXPROC)
+     *,       IHISP(MAXPROC),JLOSP(MAXPROC),JHISP(MAXPROC)
+     *,       ILOC,IHIC,JLOC,JHIC,IDIM
+     *,       ILSP,IHSP,JLSP,JHSP,ILEN,JLEN
+     *,       NODE,IXOFF,IBOFF,ISP,DDI_NP,DDI_ME,J
+     *,       NPASS,LENGTH,I
+      INTEGER MXWK
+      PARAMETER ( MXWK=8192 )
+      REAL*8 BUFF(*), PBUFF(MXWK), ONE
+      PARAMETER ( ONE=1.0E+00 )
+C
+      CALL DDI_NPROC( DDI_NP, DDI_ME )
+      CALL DDI_SUBPATCH(HANDLE,ILO,IHI,JLO,JHI
+     *,                 NSUBPATCH, NODEOFF
+     *,                 ILOSP, IHISP, JLOSP, JHISP )
+C
+C  LOOP OVER SUB-PATCHES
+C
+      IBOFF  = 1
+      DO ISP = 1 , NSUBPATCH
+        ILSP = ILOSP(ISP)
+        IHSP = IHISP(ISP)
+        JLSP = JLOSP(ISP)
+        JHSP = JHISP(ISP)
+        NODE = ISP + NODEOFF
+        ILEN = IHSP - ILSP + 1
+        JLEN = JHSP - JLSP + 1
+        CALL DDI_DISTRIB(HANDLE,NODE,ILOC,IHIC,JLOC,JHIC)
+        IDIM = IHIC - ILOC + 1
+        IXOFF= 1 +                         !   OFFSET TO
+     *         (JLSP - JLOC)*IDIM      +   !   START OF
+     *         (ILSP - ILOC)               !   SUBPATCH
+C
+C  LOCK THIS OPERATION
+C
+        CALL DDI_TICKET_LOCK( NODE )
+C
+C  REMOTE ACCUMULATE
+C
+        IF (ILEN.EQ.1) THEN  !  USE STRIDED GET/PUT
+            NPASS  = (JLEN-1)/MXWK + 1
+            LENGTH = MXWK
+            DO I = 1, NPASS
+              IF ( I .EQ. NPASS ) LENGTH = JLEN - MXWK*(NPASS-1)
+              CALL DDI_DOUBLE_IGET(PBUFF,1,DDIADDR(HANDLE),IXOFF,
+     &                        1,IDIM,LENGTH,NODE)
+              CALL DAXPY(LENGTH,ONE,BUFF(IBOFF),1,PBUFF,1)
+              CALL DDI_DOUBLE_IPUT(DDIADDR(HANDLE),IXOFF,PBUFF,1,
+     &                        IDIM,1,LENGTH,NODE)
+              IBOFF = IBOFF + LENGTH
+              IXOFF = IXOFF + LENGTH*IDIM
+            END DO
+       ELSE
+            DO J = JLSP, JHSP
+              NPASS  = (ILEN-1)/MXWK + 1
+              LENGTH = MXWK
+              DO I = 1, NPASS
+                IF ( I .EQ. NPASS ) LENGTH = ILEN - MXWK*(NPASS-1)
+                CALL DDI_DOUBLE_GET(PBUFF,1,DDIADDR(HANDLE),IXOFF,
+     &                              LENGTH,NODE)
+                CALL DAXPY(LENGTH,ONE,BUFF(IBOFF),1,PBUFF,1)
+                CALL DDI_DOUBLE_PUT(DDIADDR(HANDLE),IXOFF,PBUFF,
+     &                              1,LENGTH,NODE)
+                IBOFF = IBOFF + LENGTH
+                IXOFF = IXOFF + LENGTH
+              END DO
+              IXOFF = IXOFF - ILEN + IDIM
+         END DO
+       END IF
+       CALL SHMEM_QUIET
+C
+C  RELEASE LOCK
+C
+      CALL DDI_TICKET_UNLOCK( NODE )
+      END DO
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_GETACC
+      SUBROUTINE DDI_GETACC(HANDLE,ILO,IHI,JLO,JHI,BUFF)
+C
+C  -------------------------------------------------------------------
+C  ACCUMULATE DATA INTO A PATCH OF A DM
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+C
+      INTEGER MAXDM,MAXPROC, NROW,CMAP
+     *,       MEMDM,DDIADDR,NDM
+      INTEGER*4 DLB_COUNTER,DDILOCK
+      PARAMETER ( MAXDM = 20, MAXPROC = 1024 )
+      COMMON /DDINFO/ NROW(MAXDM),CMAP(0:MAXPROC,MAXDM)
+     *,               MEMDM(MAXDM),DDIADDR(MAXDM)
+     *,               NDM,DLB_COUNTER,DDILOCK
+C
+      INTEGER HANDLE,ILO,IHI,JLO,JHI
+     *,       NSUBPATCH,NODEOFF,ILOSP(MAXPROC)
+     *,       IHISP(MAXPROC),JLOSP(MAXPROC),JHISP(MAXPROC)
+     *,       ILOC,IHIC,JLOC,JHIC,IDIM
+     *,       ILSP,IHSP,JLSP,JHSP,ILEN,JLEN
+     *,       NODE,IXOFF,IBOFF,ISP,DDI_NP,DDI_ME,J
+     *,       NPASS,LENGTH,I
+      INTEGER MXWK
+      PARAMETER ( MXWK=8192 )
+      REAL*8 BUFF(*), PBUFF(MXWK), ONE
+      PARAMETER ( ONE=1.0E+00 )
+C
+      CALL DDI_NPROC( DDI_NP, DDI_ME )
+      CALL DDI_SUBPATCH(HANDLE,ILO,IHI,JLO,JHI
+     *,                 NSUBPATCH, NODEOFF
+     *,                 ILOSP, IHISP, JLOSP, JHISP )
+C
+C  LOOP OVER SUB-PATCHES
+C
+      IBOFF  = 1
+      DO ISP = 1 , NSUBPATCH
+        ILSP = ILOSP(ISP)
+        IHSP = IHISP(ISP)
+        JLSP = JLOSP(ISP)
+        JHSP = JHISP(ISP)
+        NODE = ISP + NODEOFF
+        ILEN = IHSP - ILSP + 1
+        JLEN = JHSP - JLSP + 1
+        CALL DDI_DISTRIB(HANDLE,NODE,ILOC,IHIC,JLOC,JHIC)
+        IDIM = IHIC - ILOC + 1
+        IXOFF= 1 +                         !   OFFSET TO
+     *         (JLSP - JLOC)*IDIM      +   !   START OF
+     *         (ILSP - ILOC)               !   SUBPATCH
+C
+C  LOCK THIS OPERATION
+C
+        CALL DDI_TICKET_LOCK( NODE )
+C
+C  REMOTE ACCUMULATE
+C
+        IF (ILEN.EQ.1) THEN  !  USE STRIDED GET/PUT
+            NPASS  = (JLEN-1)/MXWK + 1
+            LENGTH = MXWK
+            DO I = 1, NPASS
+              IF ( I .EQ. NPASS ) LENGTH = JLEN - MXWK*(NPASS-1)
+              call dcopy(length,buff(iboff),1,pbuff,1)
+              CALL DDI_DOUBLE_IGET(buff,iboff,DDIADDR(HANDLE),IXOFF,
+     &                        1,IDIM,LENGTH,NODE)
+              CALL DAXPY(LENGTH,ONE,BUFF(IBOFF),1,PBUFF,1)
+              CALL DDI_DOUBLE_IPUT(DDIADDR(HANDLE),IXOFF,PBUFF,1,
+     &                        IDIM,1,LENGTH,NODE)
+              IBOFF = IBOFF + LENGTH
+              IXOFF = IXOFF + LENGTH*IDIM
+            END DO
+       ELSE
+            DO J = JLSP, JHSP
+              NPASS  = (ILEN-1)/MXWK + 1
+              LENGTH = MXWK
+              DO I = 1, NPASS
+                IF ( I .EQ. NPASS ) LENGTH = ILEN - MXWK*(NPASS-1)
+                call dcopy(length,buff(iboff),1,pbuff,1)
+                CALL DDI_DOUBLE_GET(buff,iboff,DDIADDR(HANDLE),IXOFF,
+     &                              LENGTH,NODE)
+                CALL DAXPY(LENGTH,ONE,BUFF(IBOFF),1,PBUFF,1)
+                CALL DDI_DOUBLE_PUT(DDIADDR(HANDLE),IXOFF,PBUFF,
+     &                              1,LENGTH,NODE)
+                IBOFF = IBOFF + LENGTH
+                IXOFF = IXOFF + LENGTH
+              END DO
+              IXOFF = IXOFF - ILEN + IDIM
+         END DO
+       END IF
+       CALL SHMEM_QUIET
+C
+C  RELEASE LOCK
+C
+      CALL DDI_TICKET_UNLOCK( NODE )
+      END DO
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_LOCK
+      SUBROUTINE DDI_LOCK( TARGET_NODE )
+C
+C  -------------------------------------------------------------------
+C  MEMORY ACCESS LOCK
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+      INTEGER TARGET_NODE
+C
+      INTEGER MAXDM,MAXPROC, NROW,CMAP
+     *,       MEMDM,DDIADDR,NDM
+      INTEGER*4 DLB_COUNTER,DDILOCK
+      PARAMETER ( MAXDM = 20, MAXPROC = 1024 )
+      COMMON /DDINFO/ NROW(MAXDM),CMAP(0:MAXPROC,MAXDM)
+     *,               MEMDM(MAXDM),DDIADDR(MAXDM)
+     *,               NDM,DLB_COUNTER,DDILOCK
+C
+      INTEGER*4 SWAPPER, SHMEM_SWAP, SWAP_NODE
+C
+      SWAP_NODE = TARGET_NODE
+      SWAPPER = 0
+      DO WHILE (SWAPPER.EQ.0)
+        SWAPPER = SHMEM_SWAP( DDILOCK, 0, SWAP_NODE )
+      ENDDO
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_TICKET_LOCK
+      SUBROUTINE DDI_TICKET_LOCK( TARGET_NODE )
+C
+C  -------------------------------------------------------------------
+C  MEMORY ACCESS LOCK
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+      INTEGER TARGET_NODE, TICKET_BEING_SERVED, SHMEM_INT8_FINC
+C
+      INTEGER DDI_TICKETS, DDI_NOW_SERVING, MY_TICKET
+!*$* align_symbol(DDI_TICKETS,128)
+!*$* align_symbol(DDI_NOW_SERVING,128)
+      COMMON /DDINFO_TICKET/ DDI_TICKETS,DDI_NOW_SERVING,MY_TICKET
+C
+      INTEGER*4 TICKET_NODE,ONE
+      PARAMETER ( ONE=1 )
+C
+      TICKET_NODE = TARGET_NODE
+      MY_TICKET = SHMEM_INT8_FINC( DDI_TICKETS, TICKET_NODE )
+      TICKET_BEING_SERVED = 0
+      DO WHILE(TICKET_BEING_SERVED .NE. MY_TICKET)
+        CALL SHMEM_GET8(TICKET_BEING_SERVED,DDI_NOW_SERVING
+     *,                 ONE,TICKET_NODE)
+      ENDDO
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_TICKET_UNLOCK
+      SUBROUTINE DDI_TICKET_UNLOCK( TARGET_NODE )
+C
+C  -------------------------------------------------------------------
+C  MEMORY ACCESS LOCK
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+      INTEGER TARGET_NODE, SHMEM_INT8_FINC
+C
+      INTEGER DDI_TICKETS, DDI_NOW_SERVING, MY_TICKET
+!*$* align_symbol(DDI_TICKETS,128)
+!*$* align_symbol(DDI_NOW_SERVING,128)
+      COMMON /DDINFO_TICKET/ DDI_TICKETS,DDI_NOW_SERVING,MY_TICKET
+C
+      INTEGER*4 PUT_NODE, ONE
+      PARAMETER ( ONE=1 )
+C
+      PUT_NODE = TARGET_NODE
+      CALL SHMEM_PUT8(DDI_NOW_SERVING,MY_TICKET+1,ONE,PUT_NODE)
+      CALL SHMEM_QUIET()
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_UNLOCK
+      SUBROUTINE DDI_UNLOCK( TARGET_NODE )
+C
+C  -------------------------------------------------------------------
+C  RELEASE LOCK
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+      INTEGER TARGET_NODE
+C
+      INTEGER MAXDM,MAXPROC, NROW,CMAP
+     *,       MEMDM,DDIADDR,NDM
+      INTEGER*4 DLB_COUNTER,DDILOCK
+      PARAMETER ( MAXDM = 20, MAXPROC = 1024 )
+      COMMON /DDINFO/ NROW(MAXDM),CMAP(0:MAXPROC,MAXDM)
+     *,               MEMDM(MAXDM),DDIADDR(MAXDM)
+     *,               NDM,DLB_COUNTER,DDILOCK
+C
+      INTEGER*4 SWAPPER, SHMEM_SWAP, SWAP_NODE, SWAP_VAL
+C
+      SWAP_NODE = TARGET_NODE
+      SWAP_VAL  = -99
+      SWAPPER = SHMEM_SWAP( DDILOCK, SWAP_VAL, SWAP_NODE )
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_DLBNEXT
+      SUBROUTINE DDI_DLBNEXT( DLB_VAL )
+C
+C  -------------------------------------------------------------------
+C  REQUEST DYNAMIC LOAD BALANCING TASK INDEX
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+      INTEGER DLB_VAL,DDI_NP,DDI_ME
+C
+      INTEGER MAXDM,MAXPROC, NROW,CMAP
+     *,       MEMDM,DDIADDR,NDM
+      INTEGER*4 DLB_COUNTER,DDILOCK
+      PARAMETER ( MAXDM = 20, MAXPROC = 1024 )
+      COMMON /DDINFO/ NROW(MAXDM),CMAP(0:MAXPROC,MAXDM)
+     *,               MEMDM(MAXDM),DDIADDR(MAXDM)
+     *,               NDM,DLB_COUNTER,DDILOCK
+C
+      INTEGER*4 SHMEM_INT4_FINC,DLB_NODE
+C
+      CALL DDI_NPROC( DDI_NP, DDI_ME )
+      DLB_NODE = DDI_NP - 1
+      DLB_VAL = 1 +
+     *  SHMEM_INT4_FINC( DLB_COUNTER, DLB_NODE )
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_DLBRESET
+      SUBROUTINE DDI_DLBRESET
+C
+C  -------------------------------------------------------------------
+C  RESET DYNAMIC LOAD BALANCING TASK INDEX (GLOBAL EVENT)
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+C
+      INTEGER MAXDM,MAXPROC, NROW,CMAP
+     *,       MEMDM,DDIADDR,NDM
+      INTEGER*4 DLB_COUNTER,DDILOCK
+      PARAMETER ( MAXDM = 20, MAXPROC = 1024 )
+      COMMON /DDINFO/ NROW(MAXDM),CMAP(0:MAXPROC,MAXDM)
+     *,               MEMDM(MAXDM),DDIADDR(MAXDM)
+     *,               NDM,DLB_COUNTER,DDILOCK
+C
+      INTEGER DDI_NP, DDI_ME
+C
+      CALL DDI_SYNC( 100575 )
+      CALL DDI_NPROC( DDI_NP, DDI_ME )
+      IF (DDI_ME.EQ.DDI_NP-1) DLB_COUNTER = -1
+      CALL DDI_SYNC( 100576 )
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_BCAST
+      SUBROUTINE DDI_BCAST( MSGID, MSGTYP, BUFF, MSGLEN, PE_ROOT )
+C
+C  -------------------------------------------------------------------
+C  WRAPPER TO SHMEM 8-BYTE BROADCAST (MSGTYP LEFT FOR COMPATIBILITY)
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+C
+C  SYMMETRIC WORK ARRAY STUFF
+C
+C        INCLUDE file "shmem.fh" should work on both Origin and Altix
+C        systems, without any need to use the explict declarations that
+C        are commented out below it (here and 3 other routines).  In
+C        contrast to the MPI include file, none of these INTEGER values
+C        are passed as calling arguments.  Instead they are used just
+C        as dimensions of arrays.  The only reason to uncomment these
+C        is that they don't strictly abide by SGI compiler conventions
+C        about 32 bit quantities for that.  However, it works!
+C
+C        This file is used by default on the Origin (and was written
+C        for use on it, hence the name of the file).  Martin Hilgeman
+C        of SGI has made a few corrections to this in recent years,
+C        so that it can be used on Altix too, if you wish.  In order
+C        to build DDI over SHMEM, instead of TCP/IP, select the 
+C        communication model 'shmem' in the "compddi" script.
+C
+      INCLUDE 'mpp/shmem.fh'
+C---  INTEGER*4 SHMEM_BCAST_SYNC_SIZE, SHMEM_SYNC_VALUE
+C---  PARAMETER (SHMEM_BCAST_SYNC_SIZE   = 136)
+C---  PARAMETER (SHMEM_SYNC_VALUE = -1)
+C
+      INTEGER*4 LENGTH4,ROOT,PE_START,LOG_STRIDE,PE_SIZE
+     *,         MXWK,NUM_PES,MY_PE
+     *,         PSYNC(SHMEM_BCAST_SYNC_SIZE)
+      DATA      PSYNC/SHMEM_BCAST_SYNC_SIZE*SHMEM_SYNC_VALUE/
+      PARAMETER ( MXWK=1024, PE_START=0, LOG_STRIDE=0 )
+      REAL*8 TARGET(MXWK),SOURCE(MXWK)
+      COMMON /DDIBCST/ TARGET,SOURCE,PSYNC
+C
+      INTEGER MSGID,MSGLEN,PE_ROOT,NPASS,LOCBUF,MYNODE,LENGTH,I
+      REAL*8  BUFF(*)
+      CHARACTER*1 MSGTYP
+C
+      ROOT    = PE_ROOT
+      PE_SIZE = NUM_PES()
+      MYNODE  = MY_PE()
+      NPASS   = (MSGLEN-1)/MXWK + 1
+      LENGTH  = MXWK
+      LOCBUF  = 1
+C
+      DO I = 1, NPASS
+        IF (I.EQ.NPASS) LENGTH = MSGLEN - MXWK*(NPASS-1)
+        IF (MYNODE.EQ.PE_ROOT)
+     *  CALL DCOPY( LENGTH, BUFF(LOCBUF), 1, SOURCE, 1 )
+        CALL SHMEM_BARRIER_ALL()
+        LENGTH4 = LENGTH
+        CALL SHMEM_BROADCAST8( TARGET, SOURCE, LENGTH4
+     *,                        ROOT, PE_START, LOG_STRIDE
+     *,                        PE_SIZE, PSYNC )
+        CALL SHMEM_QUIET()
+        CALL SHMEM_BARRIER_ALL()
+        IF (MYNODE.NE.PE_ROOT)
+     *  CALL DCOPY( LENGTH, TARGET, 1, BUFF(LOCBUF), 1 )
+        LOCBUF = LOCBUF + LENGTH
+      END DO
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_GSUMF
+      SUBROUTINE DDI_GSUMF( MSGID, BUFF, MSGLEN )
+C
+C  -------------------------------------------------------------------
+C  WRAPPER TO SHMEM REAL*8 GLOBAL SUM
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+C
+C  SYMMETRIC WORK ARRAY STUFF
+C
+C         see notes in DDI_BCAST about this INCLUDE
+      INCLUDE 'mpp/shmem.fh'
+C---  INTEGER*4 SHMEM_REDUCE_SYNC_SIZE, SHMEM_SYNC_VALUE,
+C--- *          SHMEM_REDUCE_MIN_WRKDATA_SIZE
+C---  PARAMETER (SHMEM_REDUCE_MIN_WRKDATA_SIZE= 8)
+C---  PARAMETER (SHMEM_REDUCE_SYNC_SIZE  = 136)
+C---  PARAMETER (SHMEM_SYNC_VALUE = -1)
+C
+      INTEGER*4 LENGTH4,PE_START,LOG_STRIDE,PE_SIZE
+     *,         MXWK,NUM_PES,PWRKSZ
+     *,         PSYNC(SHMEM_REDUCE_SYNC_SIZE)
+      DATA      PSYNC/SHMEM_REDUCE_SYNC_SIZE*SHMEM_SYNC_VALUE/
+      PARAMETER ( MXWK=1024, PE_START=0, LOG_STRIDE=0 )
+      PARAMETER ( PWRKSZ = 1 + (MXWK/2) )
+      REAL*8 TARGET(MXWK),SOURCE(MXWK)
+     *,      PWRK(MAX(PWRKSZ,SHMEM_REDUCE_MIN_WRKDATA_SIZE))
+      COMMON /DDIGSUM/ TARGET,SOURCE,PWRK,PSYNC
+C
+      INTEGER MSGID,MSGLEN,NPASS,LENGTH,LOCBUF,I
+      REAL*8  BUFF(*)
+C
+      PE_SIZE = NUM_PES()
+      NPASS   = (MSGLEN-1)/MXWK + 1
+      LENGTH  = MXWK
+      LOCBUF  = 1
+C
+      DO I = 1, NPASS
+        IF (I.EQ.NPASS) LENGTH = MSGLEN - MXWK*(NPASS-1)
+        CALL DCOPY( LENGTH, BUFF(LOCBUF), 1, SOURCE, 1 )
+        CALL SHMEM_BARRIER_ALL()
+        LENGTH4 = LENGTH
+        CALL SHMEM_REAL8_SUM_TO_ALL( TARGET, SOURCE, LENGTH4
+     *,                              PE_START, LOG_STRIDE
+     *,                              PE_SIZE, PWRK, PSYNC )
+        CALL SHMEM_QUIET()
+        CALL DCOPY( LENGTH, TARGET, 1, BUFF(LOCBUF), 1 )
+        CALL SHMEM_BARRIER_ALL()
+        LOCBUF = LOCBUF + LENGTH
+      END DO
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_GMAXI
+      SUBROUTINE DDI_GMAXI( MSGID, BUFF, MSGLEN )
+C
+C  -------------------------------------------------------------------
+C  WRAPPER TO SHMEM INTEGER8 GLOBAL MAX
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+C
+C  SYMMETRIC WORK ARRAY STUFF
+C
+C         see notes in DDI_BCAST about this INCLUDE
+      INCLUDE 'mpp/shmem.fh'
+C---  INTEGER*4 SHMEM_REDUCE_SYNC_SIZE, SHMEM_SYNC_VALUE,
+C--- *          SHMEM_REDUCE_MIN_WRKDATA_SIZE
+C---  PARAMETER (SHMEM_REDUCE_MIN_WRKDATA_SIZE= 8)
+C---  PARAMETER (SHMEM_REDUCE_SYNC_SIZE  = 136)
+C---  PARAMETER (SHMEM_SYNC_VALUE = -1)
+C
+      INTEGER*4 LENGTH4,PE_START,LOG_STRIDE,PE_SIZE
+     *,         MXWK,NUM_PES,PWRKSZ
+     *,         PSYNC(SHMEM_REDUCE_SYNC_SIZE)
+      DATA      PSYNC/SHMEM_REDUCE_SYNC_SIZE*SHMEM_SYNC_VALUE/
+      PARAMETER ( MXWK=1024, PE_START=0, LOG_STRIDE=0 )
+      PARAMETER ( PWRKSZ = 1 + (MXWK/2) )
+      INTEGER TARGET(MXWK),SOURCE(MXWK)
+     *,       PWRK(MAX(PWRKSZ,SHMEM_REDUCE_MIN_WRKDATA_SIZE))
+      COMMON /DDIGMAX/ TARGET,SOURCE,PWRK,PSYNC
+C
+      INTEGER MSGID,MSGLEN,NPASS,LENGTH,LOCBUF,I
+      INTEGER BUFF(*)
+C
+      PE_SIZE = NUM_PES()
+      NPASS   = (MSGLEN-1)/MXWK + 1
+      LENGTH  = MXWK
+      LOCBUF  = 1
+C
+      DO I = 1, NPASS
+        IF (I.EQ.NPASS) LENGTH = MSGLEN - MXWK*(NPASS-1)
+        CALL DCOPY( LENGTH, BUFF(LOCBUF), 1, SOURCE, 1 )
+        CALL SHMEM_BARRIER_ALL()
+        LENGTH4 = LENGTH
+        CALL SHMEM_INT8_MAX_TO_ALL( TARGET, SOURCE, LENGTH4
+     *,                             PE_START, LOG_STRIDE
+     *,                             PE_SIZE, PWRK, PSYNC )
+        CALL SHMEM_QUIET()
+        CALL SHMEM_BARRIER_ALL()
+        CALL DCOPY( LENGTH, TARGET, 1, BUFF(LOCBUF), 1 )
+        LOCBUF = LOCBUF + LENGTH
+      END DO
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_GSUMI
+      SUBROUTINE DDI_GSUMI( MSGID, BUFF, MSGLEN )
+C
+C  -------------------------------------------------------------------
+C  WRAPPER TO SHMEM INTEGER8 GLOBAL SUM
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+C
+C  SYMMETRIC WORK ARRAY STUFF
+C
+C         see notes in DDI_BCAST about this INCLUDE
+      INCLUDE 'mpp/shmem.fh'
+C---  INTEGER*4 SHMEM_REDUCE_SYNC_SIZE, SHMEM_SYNC_VALUE,
+C--- *          SHMEM_REDUCE_MIN_WRKDATA_SIZE
+C---  PARAMETER (SHMEM_REDUCE_SYNC_SIZE  = 136)
+C---  PARAMETER (SHMEM_REDUCE_MIN_WRKDATA_SIZE= 8)
+C---  PARAMETER (SHMEM_SYNC_VALUE = -1)
+C
+      INTEGER*4 LENGTH4,PE_START,LOG_STRIDE,PE_SIZE
+     *,         MXWK,NUM_PES,PWRKSZ
+     *,         PSYNC(SHMEM_REDUCE_SYNC_SIZE)
+      DATA      PSYNC/SHMEM_REDUCE_SYNC_SIZE*SHMEM_SYNC_VALUE/
+      PARAMETER ( MXWK=1024, PE_START=0, LOG_STRIDE=0 )
+      PARAMETER ( PWRKSZ = 1 + (MXWK/2) )
+      INTEGER*8 TARGET(MXWK),SOURCE(MXWK)
+     *,         PWRK(MAX(PWRKSZ,SHMEM_REDUCE_MIN_WRKDATA_SIZE))
+      COMMON /DDIGSMI/ TARGET,SOURCE,PWRK,PSYNC
+C
+      INTEGER MSGID,MSGLEN,NPASS,LENGTH,LOCBUF,I
+      INTEGER BUFF(*)
+C
+      PE_SIZE = NUM_PES()
+      NPASS   = (MSGLEN-1)/MXWK + 1
+      LENGTH  = MXWK
+      LOCBUF  = 1
+C
+      DO I = 1, NPASS
+        IF (I.EQ.NPASS) LENGTH = MSGLEN - MXWK*(NPASS-1)
+        CALL DCOPY( LENGTH, BUFF(LOCBUF), 1, SOURCE, 1 )
+        CALL SHMEM_BARRIER_ALL()
+        LENGTH4 = LENGTH
+        CALL SHMEM_INT8_SUM_TO_ALL( TARGET, SOURCE, LENGTH4
+     *,                             PE_START, LOG_STRIDE
+     *,                             PE_SIZE, PWRK, PSYNC )
+        CALL SHMEM_QUIET()
+        CALL SHMEM_BARRIER_ALL()
+        CALL DCOPY( LENGTH, TARGET, 1, BUFF(LOCBUF), 1 )
+        LOCBUF = LOCBUF + LENGTH
+      END DO
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_NPROC
+      SUBROUTINE DDI_NPROC( NCPUS, MYNODE )
+C
+C  -------------------------------------------------------------------
+C  WRAPPER TO SHMEM ENVIRONMENT
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+      INTEGER*4 NUM_PES,MY_PE
+      INTEGER   NCPUS,MYNODE
+C
+      NCPUS  = NUM_PES()
+      MYNODE = MY_PE()
+      RETURN
+      END
+C*MODULE DDIO3K   *DECK DDI_NNODE
+      SUBROUTINE DDI_NNODE( DDI_NN, DDI_MY )
+      IMPLICIT NONE
+      INTEGER DDI_NN,DDI_MY
+C
+C        JUST MAP THIS AS IF USING UNIPROCESSORS
+C
+      CALL DDI_NPROC(DDI_NN,DDI_MY)
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_SYNC
+      SUBROUTINE DDI_SYNC( SYNCID )
+C
+C  -------------------------------------------------------------------
+C  WRAPPER TO SHMEM SYNCHRONISATION
+C  -------------------------------------------------------------------
+C
+      IMPLICIT NONE
+      INTEGER SYNCID
+C
+      CALL SHMEM_BARRIER_ALL()
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_DOUBLE_GET
+      SUBROUTINE DDI_DOUBLE_GET(TARGET,OFF_T,SOURCE_P
+     *,                         OFF_S,LEN,PE)
+      IMPLICIT NONE
+      REAL*8 TARGET(*),SOURCE(1)
+      POINTER (SOURCE_P,SOURCE)
+      INTEGER OFF_T,OFF_S,LEN,PE
+      INTEGER*4 LEN4,PE4
+C
+      LEN4 = LEN
+      PE4  = PE
+      CALL SHMEM_DOUBLE_GET(TARGET(OFF_T),SOURCE(OFF_S),LEN4,PE4)
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_DOUBLE_IGET
+      SUBROUTINE DDI_DOUBLE_IGET(TARGET,OFF_T,SOURCE_P
+     *,                         OFF_S,ITST,ISST,LEN,PE)
+      IMPLICIT NONE
+      REAL*8 TARGET(*),SOURCE(1)
+      POINTER (SOURCE_P,SOURCE)
+      INTEGER OFF_T,OFF_S,ITST,ISST,LEN,PE
+      INTEGER*4 LEN4,PE4,ITST4,ISST4
+C
+      LEN4 = LEN
+      PE4  = PE
+      ITST4 = ITST
+      ISST4 = ISST
+      CALL SHMEM_DOUBLE_IGET(TARGET(OFF_T),SOURCE(OFF_S)
+     *,                      ITST4,ISST4,LEN4,PE4)
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_DOUBLE_PUT
+      SUBROUTINE DDI_DOUBLE_PUT(TARGET_P,OFF_T,SOURCE,OFF_S,LEN,PE)
+      IMPLICIT NONE
+      REAL*8 TARGET(1),SOURCE(*)
+      POINTER (TARGET_P,TARGET)
+      INTEGER OFF_T,OFF_S,LEN,PE
+      INTEGER*4 LEN4,PE4
+C
+      LEN4 = LEN
+      PE4  = PE
+      CALL SHMEM_DOUBLE_PUT(TARGET(OFF_T),SOURCE(OFF_S),LEN4,PE4)
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_DOUBLE_IPUT
+      SUBROUTINE DDI_DOUBLE_IPUT(TARGET_P,OFF_T,SOURCE,OFF_S,
+     *                           ITST,ISST,LEN,PE)
+      IMPLICIT NONE
+      REAL*8 TARGET(1),SOURCE(*)
+      POINTER (TARGET_P,TARGET)
+      INTEGER OFF_T,OFF_S,ITST,ISST,LEN,PE
+      INTEGER*4 LEN4,PE4,ITST4,ISST4
+C
+      LEN4 = LEN
+      PE4  = PE
+      ITST4 = ITST
+      ISST4 = ISST
+      CALL SHMEM_DOUBLE_IPUT(TARGET(OFF_T),SOURCE(OFF_S),
+     *                       ITST4,ISST4,LEN4,PE4)
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_SHPALLOC
+      SUBROUTINE DDI_SHPALLOC(ADDR,NWORDS)
+      IMPLICIT NONE
+      INTEGER NWORDS
+      REAL*8 A(1)
+      POINTER (ADDR,A)
+      INTEGER*4 LEN4,IERR,ZERO
+      PARAMETER ( ZERO=0 )
+C
+      LEN4 = 2*NWORDS
+      CALL SHPALLOC(ADDR,LEN4,IERR,ZERO)
+      IF (IERR.NE.0) THEN
+        WRITE(*,1) 2*NWORDS
+        CALL ABORT
+      END IF
+      RETURN
+1     FORMAT(/,'* ERROR IN DDI_SHPALLOC ALLOCATING',1I12,' WORDS',/)
+      END
+C*MODULE DDIO3K  *DECK DDI_SHPDEALLC
+      SUBROUTINE DDI_SHPDEALLC(ADDR)
+      IMPLICIT NONE
+      REAL*8 A(1)
+      POINTER (ADDR, A)
+      INTEGER*4 IERR,ZERO
+      PARAMETER ( ZERO=0 )
+C
+      CALL SHPDEALLC(ADDR,IERR,ZERO)
+      IF (IERR.NE.0) CALL ABORT
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_ZERO
+      SUBROUTINE DDI_ZERO(HANDLE)
+      IMPLICIT NONE
+      INTEGER HANDLE,DDI_NP,DDI_ME,IZERO,IONE
+      INTEGER ILO,IHI,JLO,JHI,J,LEN,LOADFM,IBUF
+      REAL*8 XX,ZERO
+      COMMON /FMCOM / XX(1)
+      PARAMETER (ZERO=0.0D0,IZERO=0,IONE=1)
+C
+      CALL SHMEM_BARRIER_ALL()
+      CALL DDI_NPROC(DDI_NP,DDI_ME)
+      CALL DDI_DISTRIB(HANDLE,DDI_ME,ILO,IHI,JLO,JHI)
+      LEN = IHI-ILO+IONE
+      CALL VALFM(LOADFM)
+      IBUF = LOADFM + IONE
+      CALL GETFM(LEN)
+      CALL DCOPY(LEN,ZERO,IZERO,XX(IBUF),IONE)
+      DO J = JLO, JHI
+        CALL DDI_PUT(HANDLE,ILO,IHI,J,J,XX(IBUF))
+      END DO
+      CALL RETFM(LEN)
+      CALL SHMEM_BARRIER_ALL()
+      RETURN
+      END
+C
+C*MODULE DDIO3K  *DECK DDI_SEND
+      SUBROUTINE DDI_SEND( SNDBUF, LEN, TO)
+C
+C  -------------
+C  blocking SEND
+C  -------------
+C
+C  Note that the MPI library needs to be handed 32 bit quantities
+C  on SGI equipment, so this routine and many below will copy from
+C  the 64 bit integers passed in to 32 bit integers to send to the
+C  library's MPI routine.
+C
+      IMPLICIT NONE
+      DOUBLE PRECISION SNDBUF(*)
+      INTEGER LEN, TO
+C
+C        see note where MPI is opened about why we can't INCLUDE here.
+C---  INCLUDE 'mpif.h'
+      INTEGER*4 MPI_COMM_WORLD, MPI_BYTE
+      PARAMETER (MPI_COMM_WORLD=1)
+      PARAMETER (MPI_BYTE=27)
+      INTEGER*4 LEN4, MPITYP, TO4, MSGTAG, IERROR
+C
+      MSGTAG  = 100377
+      MPITYP  = MPI_BYTE
+      LEN4    = LEN
+      TO4     = TO
+      CALL MPI_SEND( SNDBUF, LEN4, MPITYP, TO4, MSGTAG,
+     *               MPI_COMM_WORLD, IERROR )
+C
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_RECV
+      SUBROUTINE DDI_RECV( RCVBUF, LEN, FROM)
+C
+C  -------------
+C  blocking recv
+C  -------------
+C
+      IMPLICIT NONE
+      DOUBLE PRECISION RCVBUF(*)
+      INTEGER LEN, FROM
+C
+C        see note where MPI is opened about why we can't INCLUDE here.
+C---  INCLUDE 'mpif.h'
+      INTEGER*4 MPI_COMM_WORLD, MPI_BYTE, MPI_STATUS_SIZE
+      PARAMETER (MPI_STATUS_SIZE=6)
+      PARAMETER (MPI_COMM_WORLD=1)
+      PARAMETER (MPI_BYTE=27)
+      INTEGER*4 LEN4, MPITYP, FROM4, MSGTAG, STATUS(MPI_STATUS_SIZE),
+     *          IERROR
+C
+      MSGTAG  = 100377
+      MPITYP  = MPI_BYTE
+      LEN4    = LEN
+      FROM4   = FROM
+      CALL MPI_RECV( RCVBUF, LEN4, MPITYP, FROM4, MSGTAG,
+     *               MPI_COMM_WORLD, STATUS, IERROR )
+C
+      RETURN
+      END
+C
+C*MODULE DDIO3K  *DECK DDI_ISEND
+      SUBROUTINE DDI_ISEND( SNDBUF, LEN, TO, IREQSND)
+C
+C  -----------------
+C  non-blocking SEND
+C  -----------------
+C
+C  N.B. the receive for ddi_isend must be a ddi_irecv call.
+C
+C  The ddi_wait call is explicitly paired to the use of this
+C  routine, via the request number -ireqsnd- returned from
+C  ddi_isend which is to be passed to ddi_wait.
+C
+C  There may not be any other message sent from the caller
+C  to the recipient between the ISEND/IRECV calls, and their
+C  matching WAITs, due to a limitation in the tcp/ip socket
+C  implementation (namely that there is only one socket).
+C
+C  It is safe to use these two in a bidirectional fashion.
+C
+      IMPLICIT NONE
+      DOUBLE PRECISION SNDBUF(*)
+      INTEGER LEN, TO, IREQSND
+C
+C        see note where MPI is opened about why we can't INCLUDE here.
+C---  INCLUDE 'mpif.h'
+      INTEGER*4 MPI_COMM_WORLD, MPI_BYTE
+      PARAMETER (MPI_COMM_WORLD=1)
+      PARAMETER (MPI_BYTE=27)
+      INTEGER*4 LEN4, MPITYP, TO4, MSGTAG, IREQSND4, IERROR
+C
+      LEN4    = LEN
+      MPITYP  = MPI_BYTE
+      TO4     = TO
+      MSGTAG  = 100377
+      CALL MPI_ISEND( SNDBUF, LEN4, MPITYP, TO4, MSGTAG,
+     *                MPI_COMM_WORLD, IREQSND4, IERROR )
+      IREQSND = IREQSND4
+C
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_IRECV
+      SUBROUTINE DDI_IRECV( RCVBUF, LEN, FROM, IREQRCV )
+C
+C  -----------------
+C  non-blocking recv
+C  -----------------
+C
+C  see comments in ddi_isend.
+C
+      IMPLICIT NONE
+      DOUBLE PRECISION RCVBUF(*)
+      INTEGER LEN, FROM, IREQRCV
+C
+C        see note where MPI is opened about why we can't INCLUDE here.
+C---  INCLUDE 'mpif.h'
+      INTEGER*4 MPI_COMM_WORLD, MPI_BYTE
+      PARAMETER (MPI_COMM_WORLD=1)
+      PARAMETER (MPI_BYTE=27)
+      INTEGER*4 LEN4, MPITYP, FROM4, MSGTAG, IREQRCV4, IERROR
+C
+      LEN4    = LEN
+      MPITYP  = MPI_BYTE
+      FROM4   = FROM
+      MSGTAG  = 100377
+      CALL MPI_IRECV( RCVBUF, LEN4, MPITYP, FROM4, MSGTAG,
+     *                MPI_COMM_WORLD, IREQRCV4, IERROR )
+      IREQRCV = IREQRCV4
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_WAIT
+      SUBROUTINE DDI_WAIT(IREQ)
+      IMPLICIT NONE
+      INTEGER IREQ
+C
+C     communication completion for ddi_isend/ddi_irecv (quo vadis)
+C     the request number -ireq- was generated by one of these.
+C
+C        see note where MPI is opened about why we can't INCLUDE here.
+C---  INCLUDE 'mpif.h'
+      INTEGER*4 MPI_STATUS_SIZE
+      PARAMETER (MPI_STATUS_SIZE=6)
+      INTEGER*4 IREQ4, STATUS(MPI_STATUS_SIZE), IERROR
+      IREQ4 = IREQ
+      CALL MPI_WAIT(IREQ4, STATUS, IERROR)
+      RETURN
+      END
+C
+C*MODULE DDIO3K  *DECK DDI_PROCDLB_CREATE
+      SUBROUTINE DDI_PROCDLB_CREATE(HND)
+      IMPLICIT NONE
+      INTEGER HND,DDI_NP,DDI_ME
+      CALL DDI_NPROC(DDI_NP,DDI_ME)
+      CALL DDI_CREATE(1,DDI_NP,HND)
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_PROCDLB_DESTROY
+      SUBROUTINE DDI_PROCDLB_DESTROY(HND)
+      IMPLICIT NONE
+      INTEGER HND
+      CALL DDI_DESTROY(HND)
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_PROCDLB_RESET
+      SUBROUTINE DDI_PROCDLB_RESET(HND)
+      IMPLICIT NONE
+      INTEGER HND,DDI_NP,DDI_ME
+      DOUBLE PRECISION BUFF
+      BUFF = 0.0D+00
+      CALL DDI_NPROC(DDI_NP,DDI_ME)
+      CALL DDI_SYNC(1)
+      CALL DDI_PUT(HND,1,1,DDI_ME+1,DDI_ME+1,BUFF)
+      CALL DDI_SYNC(2)
+      RETURN
+      END
+C*MODULE DDIO3K  *DECK DDI_PROCDLB_NEXT
+      SUBROUTINE DDI_PROCDLB_NEXT(HND,PROC,VALUE)
+      IMPLICIT NONE
+      INTEGER HND,PROC,VALUE
+      DOUBLE PRECISION BUFF
+      BUFF = 1.0D+00
+      CALL DDI_GETACC(HND,1,1,PROC+1,PROC+1,BUFF)
+      VALUE = INT(BUFF+0.01D+00)
+      RETURN
+      END
+c
+c*module ddi    *deck ddi_timer_reset
+      subroutine ddi_timer_reset
+c
+c        in fond memory of General Douglas MacArthur...
+c
+      return
+      end
+c
+c*module ddi    *deck DDI_GET_COMM
+      subroutine DDI_GET_COMM(handle,ilo,ihi,jlo,jhi,buff,commid)
+      integer handle,commid
+      double precision buff(*)
+c        if operating w/o groups, just ignore the communicator
+      call ddi_get(handle, ilo, iji, jlo, jhi, buff)
+      return
+      end
+c
+c*module ddi    *deck DDI_PUT_COMM
+      subroutine DDI_PUT_COMM(handle,ilo,ihi,jlo,jhi,buff,commid)
+      integer handle,commid
+      double precision buff(*)
+c        if operating w/o groups, just ignore the communicator
+      call ddi_put(handle, ilo, iji, jlo, jhi, buff)
+      return
+      end
+c
+c*module ddi    *deck DDI_ACC_COMM
+      subroutine DDI_ACC_COMM(handle,ilo,ihi,jlo,jhi,buff,commid)
+      integer handle,commid
+      double precision buff(*)
+c        if operating w/o groups, just ignore the communicator
+      call ddi_acc(handle, ilo, iji, jlo, jhi, buff)
+      return
+      end
+C
+C*MODULE DDIO3K  *DECK ddi_ngroup
+      subroutine ddi_ngroup(ngroup,mygroup)
+      implicit double precision(a-h,o-z)
+      call ddi_gddi_arimasen('DDI_NGROUP')
+      return
+      end
+C
+C*MODULE DDIO3K  *DECK ddi_scope
+      subroutine ddi_scope(iscope,imaster)
+      implicit double precision(a-h,o-z)
+      call ddi_gddi_arimasen('DDI_SCOPE')
+      return
+      end
+C
+C*MODULE DDIO3K  *DECK ddi_group_create_custom
+      subroutine ddi_group_create_custom(ngroups,igrpsiz)
+      implicit double precision(a-h,o-z)
+      dimension igrpsiz(ngroups)
+      call ddi_gddi_arimasen('DDI_GROUP_CREATE_CUSTOM')
+      return
+      end
+C
+C*MODULE DDIO3K  *DECK ddi_group_create
+      subroutine ddi_group_create(ngroups)
+      implicit double precision(a-h,o-z)
+      call ddi_gddi_arimasen('DDI_GROUP_CREATE')
+      return
+      end
+C
+C*MODULE DDIO3K  *DECK ddi_gdlbreset
+      subroutine ddi_gdlbreset
+      implicit double precision(a-h,o-z)
+      call ddi_gddi_arimasen('DDI_GDLBRESET')
+      return
+      end
+C
+C*MODULE DDIO3K  *DECK ddi_gdlbnext
+      subroutine ddi_gdlbnext(nxtval)
+      implicit double precision(a-h,o-z)
+      call ddi_gddi_arimasen('DDI_GDLBNEXT')
+      return
+      end
+c
+c*module ddi    *deck ddi_smp_nproc
+      subroutine ddi_smp_nproc(nproc,me)
+      implicit double precision(a-h,o-z)
+      call ddi_gddi_arimasen('DDI_SMP_NPROC')
+      return
+      end
+c
+c*module ddi    *deck ddi_smp_create
+      subroutine ddi_smp_create(isize,ihandle)
+      implicit double precision(a-h,o-z)
+      call ddi_gddi_arimasen('DDI_SMP_CREATE')
+      return
+      end
+c
+c*module ddi    *deck ddi_smp_offset
+      subroutine ddi_smp_offset(ihandle, addr, ioffset)
+      implicit double precision(a-h,o-z)
+      character*(*) addr
+      call ddi_gddi_arimasen('DDI_SMP_OFFSET')
+      return
+      end
+c
+c*module ddi    *deck ddi_smp_sync
+      subroutine ddi_smp_sync()
+      implicit double precision(a-h,o-z)
+      call ddi_gddi_arimasen('DDI_SMP_SYNC')
+      return
+      end
+c
+c*module ddi    *deck ddi_smp_destroy
+      subroutine ddi_smp_destroy(ihandle)
+      implicit double precision(a-h,o-z)
+      call ddi_gddi_arimasen('DDI_SMP_DESTROY')
+      return
+      end
+c
+c*module ddi    *deck ddi_smp_gsumf
+      subroutine ddi_smp_gsumf(msgtag,buff,len)
+      implicit double precision(a-h,o-z)
+      dimension buff(*)
+      call ddi_gddi_arimasen('DDI_SMP_GSUMF')
+      return
+      end
+c
+c*module ddi    *deck ddi_smp_bcast
+      subroutine ddi_smp_bcast(msgtag, type, buff, len, ifrom)
+      implicit double precision(a-h,o-z)
+      character*(*) type
+      dimension buff(*)
+      call ddi_gddi_arimasen('DDI_SMP_BCAST')
+      return
+      end
+c
+c*module ddi    *deck ddi_masters_gsumf
+      subroutine ddi_masters_gsumf(msgtag, buff, len)
+      implicit double precision(a-h,o-z)
+      dimension buff(*)
+      call ddi_gddi_arimasen('DDI_MASTERS_GSUMF')
+      return
+      end
+c
+c*module ddi    *deck ddi_masters_bcast
+      subroutine ddi_masters_bcast(msgtag, type, buff, len, ifrom)
+      implicit double precision(a-h,o-z)
+      character*(*) type
+      dimension buff(*)
+      call ddi_gddi_arimasen('DDI_MASTERS_BCAST')
+      return
+      end
+c
+c*module ddi    *deck ddi_arimasen
+      subroutine ddi_gddi_arimasen(routine)
+      character*(*) routine
+C
+C        arimasen is Japanese for "does not exist"
+C
+      write(6,900) routine
+      call abrt
+      stop
+  900 format(1x,'Group DDI is not implemented in the SHMEM',
+     *          ' version of DDI, yet.'/
+     *       1x,'Your input has tried to call GDDI routine ',a,'.'/
+     *       1x,'Sorry, group DDI implementation of SHMEM is in',
+     *          ' progress.')
+      end
