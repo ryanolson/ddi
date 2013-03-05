@@ -1,6 +1,8 @@
 #include "mpi.h"
 #include "ddi.h"
 
+extern char * DDI_Id();
+
 int main(int argc,char *argv[]) {
 
    int i,np,me,ncols;
@@ -36,10 +38,10 @@ int main(int argc,char *argv[]) {
    do {
       DDI_DLBNext(&counter);
       if(counter % 200 == 0) {
-         fprintf(stdout,"%s: counter=%i\n",DDI_Id(),counter);
-         fflush(stdout);
+//       fprintf(stdout,"%s: counter=%i\n",DDI_Id(),counter);
+//       fflush(stdout);
       }
-      if(my == 0) usleep(20);
+//    if(my == 0) usleep(20);
    } while (counter < 30000);
 
 // MPI_Barrier(MPI_COMM_WORLD);
