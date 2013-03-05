@@ -19,13 +19,13 @@ void DDI_ARMCI_Memory_init(size_t size) {
   gv(dda_index) = (DDA_Index*)gv(armci_mem_addr)[comm->me];
 
   // malloc ARMCI counter block and set addresses
-  code = ARMCI_Malloc((void*)gv(armci_cnt_addr),sizeof(int)*2);
+  code = ARMCI_Malloc((void*)gv(armci_cnt_addr),sizeof(armci_counter_t)*2);
   if (code > 0) {
     ARMCI_Error("ARMCI_Malloc failed",code);
     Fatal_error(911);
   }
-  ARMCI_PutValueInt(0, (void*)(gv(armci_cnt_addr)[comm->me]+0), comm->me);
-  ARMCI_PutValueInt(0, (void*)(gv(armci_cnt_addr)[comm->me]+1), comm->me);
+  ARMCI_PutValueLong(0, (void*)(gv(armci_cnt_addr)[comm->me]+0), comm->me);
+  ARMCI_PutValueLong(0, (void*)(gv(armci_cnt_addr)[comm->me]+1), comm->me);
   DDI_ARMCI_DLB_addr();
   DDI_ARMCI_GDLB_addr();
   
@@ -40,7 +40,7 @@ void DDI_ARMCI_Memory_init(size_t size) {
 
 // figure out remote memory address of dynamic load balancer
 void DDI_ARMCI_DLB_addr() {
-    int *cnt_ptr;
+    armci_counter_t *cnt_ptr;
     const DDI_Comm *comm = (const DDI_Comm *) Comm_find(DDI_WORKING_COMM);
     
     cnt_ptr = gv(armci_cnt_addr)[comm->global_pid[0]];
@@ -59,13 +59,13 @@ void DDI_ARMCI_DLBNext(size_t *counter) {
     const DDI_Comm *comm = (const DDI_Comm *) Comm_find(DDI_WORKING_COMM);
 
     // increment counter
-    ARMCI_Rmw(ARMCI_FETCH_AND_ADD,&tmp,(void*)gv(dlb_counter),1,comm->global_pid[0]);
+    ARMCI_Rmw(ARMCI_FETCH_AND_ADD_LONG,&tmp,(void*)gv(dlb_counter),1,comm->global_pid[0]);
     *counter = (size_t)tmp;
 }
 
 // figure out remote memory address of global dynamic load balancer
 void DDI_ARMCI_GDLB_addr() {
-    int *cnt_ptr;
+    armci_counter_t *cnt_ptr;
     const DDI_Comm *comm = (const DDI_Comm *) Comm_find(DDI_COMM_WORLD);
 
     cnt_ptr = gv(armci_cnt_addr)[comm->global_pid[0]];

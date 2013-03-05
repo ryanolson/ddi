@@ -14,11 +14,13 @@
 #include <mpi.h>
 #include <armci.h>
 
+typedef long armci_counter_t;
+
 /* ARMCI memory addresses */
 void* gv(armci_mem_addr)[MAX_PROCESSORS];
 
 /* ARMCI counter addresses */
-int* gv(armci_cnt_addr)[MAX_PROCESSORS];
+armci_counter_t * gv(armci_cnt_addr)[MAX_PROCESSORS];
 
 /* DDI_ARMCI remote memory structure and array */
 typedef struct {
