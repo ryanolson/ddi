@@ -339,7 +339,7 @@
       free(np_by_node);
       free(nc_by_node);
       free(nd_by_node);
-      free(ranks_by_node[0]); /* this is the ranks array from Init_mpi */
+      // free(ranks_by_node[0]); /* this is the ranks array from Init_mpi */
       free(ranks_by_node);
    
       MPI_Finalize();

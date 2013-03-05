@@ -128,7 +128,7 @@
 #if defined DDI_ARMCI
       DDI_ARMCI_Acc(patch,&scale,buff);
       return;
-#endif
+#else
 
    /* ------------------------------------------------------- *\
       Determine where the pieces of the requested patch exist
@@ -326,12 +326,12 @@
          }
       }
     # endif
-
+#endif // defined DDI_ARMCI
       MAX_DEBUG((stdout,"%s: Leaving DDI_AccP.\n",DDI_Id()))
       
    }
 
-
+#if defined DDI_ONESIDED
 /* -------------------------------------------------------------- *\
    DDI_Acc_local(patch,buff)
    =========================
@@ -341,8 +341,7 @@
    Accumulates the subpatch specified by patch and stored in buff
    into the share-memory segment(s) of the local node.
 \* -------------------------------------------------------------- */
-   void DDI_Acc_local(const DDI_Patch* patch,void *buff) {
-   
+   void DDI_Acc_local(const DDI_Patch* patch,void *buff) { 
    /* --------------- *\
       Local Variables
    \* --------------- */
@@ -429,6 +428,7 @@
       MAX_DEBUG((stdout,"%s: Leaving DDI_Acc_local.\n",DDI_Id()))
    }
 
+#endif // defined DDI_ONESIDED
 static double *tacc = NULL;
 
 /* ----------------------------------------------------------------- *\
@@ -442,7 +442,8 @@ static double *tacc = NULL;
    from local get/put operations until the accumulate has finished.
 \* ----------------------------------------------------------------- */
    void DDI_Acc_server(const DDI_Patch *msg,int from) {
-   
+
+#if defined DDI_ONESIDED
    /* --------------- *\
       Local Variables
    \* --------------- */
@@ -640,6 +641,8 @@ static double *tacc = NULL;
         
 
          }
+       # elif defined DDI_ARMCI
+       // DDI_ARMCI is fine
        # else
        # error DDI_ONESIDED not defined
        # endif
@@ -661,8 +664,10 @@ static double *tacc = NULL;
    // tacc[0],tacc[1],tacc[2],tacc[3],tacc[4],tacc[5],tacc[6]);
       if(twait)
       printf("%06d [cp] twait=%10.3lf\n",cos_me,twait);
+# endif // defined DDI_ONESIDED
    }
 
+#if defined DDI_ONESIDED
    void DDI_Acc_remote(void *buff,DDI_Patch *patch,int remote_id) {
       char ack = 39;
       const DDI_Patch *msg = (const DDI_Patch *) patch;
@@ -840,3 +845,4 @@ static double *tacc = NULL;
       STD_DEBUG((stdout,"%s: Exiting DDI_Acc_lapi_server.\n",DDI_Id()))
    }
  # endif
+ # endif // defined DDI_ONESIDED

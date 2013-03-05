@@ -98,7 +98,7 @@ void DDI_ARMCI_Index_create(DDA_Index *index, int handle) {
   armci_index[comm->me].semid = handle;
   gv(dda_comm)[handle] = DDI_WORKING_COMM;
 
-  MPI_Allgather(&armci_index[comm->me],sizeof(DDA_ARMCI_Index),MPI_BYTE,
+  MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, 
 		armci_index,sizeof(DDA_ARMCI_Index),MPI_BYTE,
 		comm->compute_comm);
 }

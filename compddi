@@ -15,7 +15,7 @@
 #      linux32,linux64,linux-ia64,mac32,mac64,macG5,necsx,
 #      sgi32,sgi64,sun32,sun64
 #
-         set TARGET = cray-xt
+         set TARGET = cray-xe
 
 #  2. Choose DDI communication layer, the only legal values are
 #                   sockets,mixed,mpi,shmem,lapi,armci
@@ -51,9 +51,9 @@
          if ($TARGET == cray-t3e)     set COMM=shmem
          if ($TARGET == cray-x1)      set COMM=shmem
          if ($TARGET == cray-xd1)     set COMM=sockets
-         if ($TARGET == cray-xt)      set COMM=shmem
          if ($TARGET == cray-xt)      set COMM=mpi
          if ($TARGET == cray-xt)      set COMM=onesided
+         if ($TARGET == cray-xe)      set COMM=armci
          if ($TARGET == ibm-bg)       set COMM=armci
          if ($TARGET == ibm64-sp)     set COMM=lapi
          if ($TARGET == sgi64)        set COMM=shmem
@@ -68,6 +68,8 @@
          if ($TARGET == cray-xd1) set MAXNODES=512
          if ($TARGET == cray-xt)  set MAXCPUS=32    # modify to match cores/node
          if ($TARGET == cray-xt)  set MAXNODES=512  # bump to match your XT
+         if ($TARGET == cray-xe)  set MAXCPUS=64    # modify to match cores/node
+         if ($TARGET == cray-xe)  set MAXNODES=1024 # bump to match your XT
          if ($TARGET == ibm-bg)   set MAXCPUS=1
          if ($TARGET == ibm-bg)   set MAXNODES=2048 # bump to match your BG/L
 
@@ -84,6 +86,7 @@
          set SYSV = true
          if ($TARGET == cray-xt)  set SYSV=false
          if ($TARGET == cray-xt)  set SYSV=true
+         if ($TARGET == cray-xe)  set SYSV=false # XC30 uses XPMEM in ARMCI
          if ($TARGET == ibm-bg)   set SYSV=false
          if ($COMM == armci)      set SYSV=false
 
@@ -369,6 +372,36 @@
      set F77_OPTS = " -DINT_SIZE=long -D_UNDERSCORES=1"
      set RANLIB_FLAGS = ' '
   endif
+
+
+# ------- #
+# Cray XE #
+# ------- #
+if($TARGET == cray-xe) then
+   set CC = 'cc'
+   set GA_CONFIG = "$DDI_GA_CONFIG_PATH/ga-config"
+   set CFLAGS = "-DUSE_MPI_BARRIER `$GA_CONFIG --cppflags` `$GA_CONFIG --cflags`"
+   set CFLAGS = "$CFLAGS -I./include -I./src"
+
+   echo "** Using the $PE_ENV Compiler **"
+
+   if($PE_ENV == PGI)  then
+      set CFLAGS = "$CFLAGS -fastsse -O3"
+   else if ($PE_ENV == CRAY) then
+      set CFLAGS = "$CFLAGS"
+   else if ($PE_ENV == GNU) then
+      set CFLAGS = "$CFLAGS -m64 -O3 -fstrict-aliasing"
+   else if ($PE_ENV == INTEL) then
+      set CFLAGS = "$CFLAGS -O3 -fstrict-aliasing"
+   else 
+      echo "Cray Programming Environment not recognized"
+      exit 4
+   endif
+
+   set AR_FLAGS     = 'cr'
+   set RANLIB_FLAGS = ' '
+   set F77_OPTS = "-DINT_SIZE=long -D_UNDERSCORES=1"
+endif
 
 
 # ------- #
